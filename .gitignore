@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# venv
+.venv/
+
+# Training outputs
+outputs/
+
+# Logs
+logs/
+
+# References
+refs/
+
+# Data splits (generated)
+splits/
+
+# Unsloth cache
+unsloth_compiled_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# direnv
+.envrc
+
+# claude
+claude-kenny
+
+# wandb
+wandb
+
