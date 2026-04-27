@@ -1,0 +1,22 @@
+# VideoMAE V2 ViT-Base feature extraction (for the 30s/10s chunk dataset).
+# Runtime defaults; I/O paths must be supplied via --annot-dir / --video-dir /
+# --out-dir / --ckpt-path on the command line (or override here).
+
+model_name: vit_base_patch16_224
+ckpt_path: models/vit_b/vit_b_k710_dl_from_giant.pth   # K710 distilled (giant teacher)
+
+target_fps: 10.0
+window_size: 16
+stride: 2
+input_size: 224
+resize_mode: squash
+
+batch_size: 16
+num_workers: 0
+device: cuda
+dtype: float16
+save_dtype: float16
+
+video_suffix: .mp4
+overwrite: false
+fail_on_missing_video: false

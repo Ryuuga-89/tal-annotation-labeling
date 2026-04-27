@@ -19,6 +19,23 @@ A repository that uses TAL technology to create annotation labels for video data
 - Videos: `/raid/containers/enroot/data/b100/ft_fact_videos/30s_chunks/{video-stem}.mp4`
 - ~63k annotation files
 
+## 環境
+
+### 各種環境変数
+
+```bash
+export UV_CACHE_DIR=/lustre/work/mt/.uv-cache
+export HF_HOME=/lustre/work/mt/.cache/huggingface
+export ANNOT_ROOT_DIR=/raid/containers/enroot/data/b100/ft_fact_videos/annot/30s_chunks_action_31detail_2
+export VIDEO_DATA_DIR=/raid/containers/enroot/data/b100/ft_fact_videos/30s_chunks
+```
+
+### モデルへのパス
+
+#### 特徴量検出用：vit_b
+
+/lustre/work/mt/okamura/tal-annotation-labeling/models/vit_b/vit_b_k710_dl_from_giant.pth
+
 ## 指示
 
 /raid/containers/enroot/data/b100/ft_fact_videos/annot/30s_chunks_action_31detail_2/*にannotation file が {video-stem}.json で入っている。

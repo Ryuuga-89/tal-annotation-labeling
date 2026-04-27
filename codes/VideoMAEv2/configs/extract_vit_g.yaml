@@ -1,0 +1,21 @@
+# VideoMAE V2 ViT-giant feature extraction (for the 30s/10s chunk dataset).
+# Heavier than ViT-B (~1B params). Reduce batch_size if VRAM is tight.
+
+model_name: vit_giant_patch14_224
+# ckpt_path: /path/to/vit_g_hybrid_pt_1200e_k710_ft.pth   # uncomment and set when running
+
+target_fps: 10.0
+window_size: 16
+stride: 2
+input_size: 224
+resize_mode: squash
+
+batch_size: 4
+num_workers: 0
+device: cuda
+dtype: float16
+save_dtype: float16
+
+video_suffix: .mp4
+overwrite: false
+fail_on_missing_video: false
