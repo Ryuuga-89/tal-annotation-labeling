@@ -7,3 +7,12 @@
 [submodule "repos/VideoMAEv2"]
 	path = repos/VideoMAEv2
 	url = https://github.com/OpenGVLab/VideoMAEv2.git
+[submodule "repos/VCLTDR-GMG"]
+	path = repos/VCLTDR-GMG
+	url = https://github.com/LiQiang0307/CLTDR-GMG.git
+[submodule "repos/OpenTAL"]
+	path = repos/OpenTAL
+	url = https://github.com/Cogito2012/OpenTAL.git
+[submodule "repos/DiffusionTAD"]
+	path = repos/DiffusionTAD
+	url = https://github.com/sauradip/DiffusionTAD.git

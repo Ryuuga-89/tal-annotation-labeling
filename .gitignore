@@ -11,6 +11,9 @@ outputs/
 # Logs
 logs/
 
+# models
+models/
+
 # References
 refs/
 
@@ -35,3 +38,6 @@ claude-kenny
 # wandb
 wandb
 
+reports
+
+data
