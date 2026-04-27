@@ -4,3 +4,6 @@
 [submodule "repos/E2E-TAD"]
 	path = repos/E2E-TAD
 	url = https://github.com/xlliu7/E2E-TAD.git
+[submodule "repos/VideoMAEv2"]
+	path = repos/VideoMAEv2
+	url = https://github.com/OpenGVLab/VideoMAEv2.git
