@@ -7,6 +7,11 @@ requires-python = ">=3.12"
 dependencies = [
     "decord>=0.6.0",
     "einops>=0.8.2",
+    # ActionFormer (upstream) dependencies
+    "h5py>=3.0",
+    "joblib>=1.3",
+    "pandas>=2.0",
+    "tensorboard>=2.15",
     "numpy>=2.4.4",
     "opencv-python>=4.13.0.92",
     "pillow>=12.2.0",
@@ -17,6 +22,10 @@ dependencies = [
     "torch==2.5.1",
     "torchvision==0.20.1",
     "tqdm>=4.67.3",
+    # Data analysis and visualization
+    "matplotlib>=3.8.0",
+    "seaborn>=0.13.0",
+    "japanize-matplotlib>=1.1.3",
 ]
 
 [[tool.uv.index]]
