@@ -16,3 +16,9 @@
 [submodule "repos/DiffusionTAD"]
 	path = repos/DiffusionTAD
 	url = https://github.com/sauradip/DiffusionTAD.git
+[submodule "repo/ActionFormer"]
+	path = repo/ActionFormer
+	url = https://github.com/happyharrycn/actionformer_release
+[submodule "repos/ActionFormer"]
+	path = repos/ActionFormer
+	url = https://github.com/happyharrycn/actionformer_release
