@@ -57,6 +57,10 @@ class ExtractConfig:
     video_dir: str = ""
     out_dir: str = ""
     video_suffix: str = ".mp4"
+    # If set, restrict processing to annotation json filenames listed here
+    # (one per line, no directory). Resolved against annot_dir. Useful to feed
+    # the subset list emitted by tools/sample_subset.py.
+    annot_list: str = ""
     # Model
     model_name: str = "vit_base_patch16_224"
     ckpt_path: str = ""
@@ -109,6 +113,9 @@ def parse_args(argv: list[str] | None = None) -> ExtractConfig:
     p.add_argument("--video-dir", type=str, default=None)
     p.add_argument("--out-dir", type=str, default=None)
     p.add_argument("--video-suffix", type=str, default=None)
+    p.add_argument("--annot-list", type=str, default=None,
+                   help="File listing annotation json filenames (one per line). "
+                        "Restricts processing to this subset.")
     p.add_argument("--model-name", type=str, default=None)
     p.add_argument("--ckpt-path", type=str, default=None)
     p.add_argument("--target-fps", type=float, default=None)
@@ -137,6 +144,7 @@ def parse_args(argv: list[str] | None = None) -> ExtractConfig:
         "video_dir": args.video_dir,
         "out_dir": args.out_dir,
         "video_suffix": args.video_suffix,
+        "annot_list": args.annot_list,
         "model_name": args.model_name,
         "ckpt_path": args.ckpt_path,
         "target_fps": args.target_fps,
@@ -290,7 +298,30 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    json_paths = sorted(annot_dir.glob("*.json"))
+    if cfg.annot_list:
+        list_path = Path(cfg.annot_list)
+        names = [
+            ln.strip() for ln in list_path.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.startswith("#")
+        ]
+        json_paths = []
+        missing: list[str] = []
+        for n in names:
+            # Allow either a bare filename or a full path; we only use the name.
+            jp = annot_dir / Path(n).name
+            if jp.exists():
+                json_paths.append(jp)
+            else:
+                missing.append(n)
+        json_paths.sort()
+        if missing:
+            print(
+                f"[warn] {len(missing)}/{len(names)} entries in {list_path} "
+                f"not found under {annot_dir} (showing up to 5): {missing[:5]}",
+                flush=True,
+            )
+    else:
+        json_paths = sorted(annot_dir.glob("*.json"))
     if cfg.limit is not None:
         json_paths = json_paths[: cfg.limit]
     if cfg.num_shards < 1:

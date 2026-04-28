@@ -68,6 +68,9 @@ extra_args=()
 if [[ -n "${limit}" ]]; then
   extra_args+=(--limit "${limit}")
 fi
+if [[ -n "${LIST:-}" ]]; then
+  extra_args+=(--annot-list "${LIST}")
+fi
 
 # ---------- GPU / world size ----------
 GPU_LIST="${GPU:-0}"
