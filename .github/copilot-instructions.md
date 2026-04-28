@@ -21,7 +21,7 @@ A repository that uses TAL technology to create annotation labels for video data
 
 ## 環境
 
-### 各種環境変数
+### 各種環境変数(実行時に設定必須)
 
 ```bash
 export UV_CACHE_DIR=/lustre/work/mt/.uv-cache

@@ -19,6 +19,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 import time
@@ -28,7 +29,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Allow `python -m VideoMAEv2.extract_features` from the project root.
@@ -40,7 +40,6 @@ if str(_PKG_PARENT) not in sys.path:
 from VideoMAEv2.dataset import (  # noqa: E402
     AnnotationRecord,
     VideoChunkDataset,
-    load_annotation,
 )
 from VideoMAEv2.dataset.chunk_dataset import collate_clips, pair_video_with_annotation  # noqa: E402
 from VideoMAEv2.models import build_backbone  # noqa: E402
@@ -235,18 +234,18 @@ def extract_one(
             "num_target_frames": ds.spec.num_target_frames,
         }
 
-    loader = DataLoader(
-        ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        collate_fn=collate_clips,
-        pin_memory=(device.type == "cuda"),
-    )
-
-    feats = np.empty((len(ds), backbone.embed_dim), dtype=save_dtype)
+    num_steps = len(ds)
+    feats = np.empty((num_steps, backbone.embed_dim), dtype=save_dtype)
     autocast_enabled = device.type == "cuda" and dtype != torch.float32
-    for batch in loader:
+    if cfg.num_workers not in (None, 0):
+        print(
+            f"[warn] num_workers={cfg.num_workers} is ignored for per-video extraction; using 0",
+            flush=True,
+        )
+
+    for start in range(0, num_steps, cfg.batch_size):
+        items = [ds[i] for i in range(start, min(num_steps, start + cfg.batch_size))]
+        batch = collate_clips(items)
         clips = batch.clips.to(device, non_blocking=True)
         idx = batch.step_idx.numpy()
         with torch.inference_mode():
@@ -256,6 +255,8 @@ def extract_one(
             else:
                 out = backbone(clips)
         feats[idx] = out.float().cpu().numpy().astype(save_dtype)
+        del clips, out, idx
+        gc.collect()
 
     np.save(out_npy, feats)
 
@@ -272,19 +273,24 @@ def extract_one(
         "stride": cfg.stride,
         "input_size": cfg.input_size,
         "resize_mode": cfg.resize_mode,
-        "num_steps": len(ds),
+        "num_steps": num_steps,
         "embed_dim": backbone.embed_dim,
         "model_name": cfg.model_name,
         "ckpt_path": cfg.ckpt_path,
         "save_dtype": cfg.save_dtype,
         "compute_dtype": cfg.dtype,
-        # First step time span; downstream can derive others as i*stride/fps.
-        "step_time_first": [0.0, cfg.window_size / cfg.target_fps],
+        "step_time": _make_step_time_index(num_steps, cfg.target_fps, cfg.stride, cfg.window_size),
     }
     with out_meta.open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    return {"stem": rec.video_stem, "status": "ok", "num_steps": len(ds)}
+    # Explicit cleanup to prevent memory leaks in long-running parallel extraction
+    del ds, feats, batch
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return {"stem": rec.video_stem, "status": "ok", "num_steps": num_steps}
 
 
 def main(argv: list[str] | None = None) -> int:

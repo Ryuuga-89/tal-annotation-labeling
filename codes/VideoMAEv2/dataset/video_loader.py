@@ -109,6 +109,49 @@ def _resize_shortside_then_center_crop(
     return t
 
 
+def load_target_fps_frames(
+    spec: VideoSpec,
+    *,
+    start_target_idx: int,
+    num_frames: int,
+    vr: VideoReader | None = None,
+) -> np.ndarray:
+    """Load `num_frames` consecutive frames on the target-fps timeline.
+
+    The returned array keeps the original uint8 layout [T, H, W, 3].
+    """
+    if vr is None:
+        vr = VideoReader(str(spec.path), num_threads=1, ctx=cpu(0))
+    src_idx = _target_to_source_indices(spec, start_target_idx, num_frames)
+    return vr.get_batch(src_idx).asnumpy()
+
+
+def load_video_at_target_fps(
+    spec: VideoSpec,
+    *,
+    input_size: int = 224,
+    resize_mode: str = "squash",
+    normalize: bool = True,
+    vr: VideoReader | None = None,
+) -> torch.Tensor:
+    """Load the whole video once at target fps and return [3, T, H, W]."""
+    frames = load_target_fps_frames(
+        spec,
+        start_target_idx=0,
+        num_frames=spec.num_target_frames,
+        vr=vr,
+    )
+    if resize_mode == "squash":
+        clip = _resize_squash(frames, input_size)
+    elif resize_mode == "shortside_crop":
+        clip = _resize_shortside_then_center_crop(frames, input_size)
+    else:
+        raise ValueError(f"unknown resize_mode={resize_mode!r}")
+    if normalize:
+        clip = (clip - 0.5) / 0.5
+    return clip
+
+
 def load_clip_at_target_fps(
     spec: VideoSpec,
     *,
@@ -124,10 +167,12 @@ def load_clip_at_target_fps(
     Returns a tensor of shape (3, window_size, input_size, input_size).
     `normalize=True` applies VideoMAE's mean=std=0.5 normalization.
     """
-    if vr is None:
-        vr = VideoReader(str(spec.path), num_threads=1, ctx=cpu(0))
-    src_idx = _target_to_source_indices(spec, start_target_idx, window_size)
-    frames = vr.get_batch(src_idx).asnumpy()  # [T,H,W,3] uint8
+    frames = load_target_fps_frames(
+        spec,
+        start_target_idx=start_target_idx,
+        num_frames=window_size,
+        vr=vr,
+    )
     if resize_mode == "squash":
         clip = _resize_squash(frames, input_size)
     elif resize_mode == "shortside_crop":

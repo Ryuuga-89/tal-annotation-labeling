@@ -92,10 +92,15 @@ def main() -> int:
                 pass
             for f in AUX_FIELDS:
                 v = a.get(f)
+                # Treat None or blank/whitespace-only strings as missing
                 if v is None:
                     counters[f]["__MISSING__"] += 1
                 else:
-                    counters[f][str(v).strip()] += 1
+                    sv = str(v).strip()
+                    if sv == "":
+                        counters[f]["__MISSING__"] += 1
+                    else:
+                        counters[f][sv] += 1
 
     # ---- summary stats ----
     def quantiles(xs: list[float], qs=(0.0, 0.25, 0.5, 0.75, 0.95, 0.99, 1.0)) -> dict:

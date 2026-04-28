@@ -18,7 +18,7 @@ from decord import VideoReader, cpu
 from torch.utils.data import Dataset
 
 from .annotation import AnnotationRecord, load_annotation
-from .video_loader import VideoSpec, load_clip_at_target_fps, probe_video
+from .video_loader import VideoSpec, load_video_at_target_fps, probe_video
 
 
 class ClipBatch(NamedTuple):
@@ -69,7 +69,8 @@ class VideoChunkDataset(Dataset):
         )
         self.spec = spec or probe_video(self.video_path, target_fps=target_fps)
         self._n_steps = self.spec.num_steps(window_size=window_size, stride=stride)
-        self._vr_singleproc: VideoReader | None = None
+        self._vr: VideoReader | None = None
+        self._video_tensor: torch.Tensor | None = None
 
     def __len__(self) -> int:
         return self._n_steps
@@ -79,29 +80,32 @@ class VideoChunkDataset(Dataset):
         return self._n_steps
 
     def _get_reader(self) -> VideoReader:
-        if torch.utils.data.get_worker_info() is not None:
-            # Worker process: don't cache (decord reader not picklable / not
-            # shared). Fall through to a per-call reader.
-            return VideoReader(str(self.video_path), num_threads=1, ctx=cpu(0))
-        if self._vr_singleproc is None:
-            self._vr_singleproc = VideoReader(
-                str(self.video_path), num_threads=1, ctx=cpu(0)
+        if self._vr is None:
+            self._vr = VideoReader(str(self.video_path), num_threads=1, ctx=cpu(0))
+        return self._vr
+
+    def _get_video_tensor(self) -> torch.Tensor:
+        if self._video_tensor is None:
+            self._video_tensor = load_video_at_target_fps(
+                self.spec,
+                input_size=self.cfg.input_size,
+                resize_mode=self.cfg.resize_mode,
+                vr=self._get_reader(),
             )
-        return self._vr_singleproc
+        return self._video_tensor
+
+    def windowed_clips(self) -> torch.Tensor:
+        """Return all sliding-window clips as a view of shape [N, 3, T, H, W]."""
+        video_tensor = self._get_video_tensor()
+        return video_tensor.unfold(1, self.cfg.window_size, self.cfg.stride).permute(1, 0, 4, 2, 3)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
         if idx < 0 or idx >= self._n_steps:
             raise IndexError(idx)
         start_target_idx = idx * self.cfg.stride
-        clip = load_clip_at_target_fps(
-            self.spec,
-            start_target_idx=start_target_idx,
-            window_size=self.cfg.window_size,
-            input_size=self.cfg.input_size,
-            resize_mode=self.cfg.resize_mode,
-            vr=self._get_reader(),
-        )
-        return clip, idx
+        video_tensor = self._get_video_tensor()
+        clip = video_tensor[:, start_target_idx : start_target_idx + self.cfg.window_size]
+        return clip.contiguous(), idx
 
 
 def collate_clips(items: list[tuple[torch.Tensor, int]]) -> ClipBatch:

@@ -12,7 +12,7 @@ val_split:   ['val']
 
 dataset: {
   json_file: "",                     # unused for tal_motion
-  feat_folder: data/features/30s_mae_b_16_2/subset_v1,
+  feat_folder: data/features/30s_mae_b_16_2,
   file_prefix: ~,
   file_ext: .npy,
   num_classes: 1,                    # class-agnostic; aux_type is auxiliary
