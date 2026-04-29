@@ -69,6 +69,43 @@ def get_video_ids_from_dir(feat_dir: str) -> list[str]:
     return stems
 
 
+def _load_feature_entries_from_txt(path_list_txt: str, feat_dir: str) -> list[tuple[str, str]]:
+    """Parse a txt list and resolve (video_id, feat_file) entries.
+
+    - .npy lines: use the file path directly
+    - .json lines: resolve to <feat_dir>/<stem>.npy
+    """
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for ln in Path(path_list_txt).read_text(encoding="utf-8").splitlines():
+        line = ln.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = Path(line)
+        stem = p.stem
+        suffix = p.suffix.lower()
+        if suffix == ".npy":
+            feat_file = str(p)
+        elif suffix == ".json":
+            if not feat_dir:
+                raise ValueError(
+                    "feature list contains .json paths but feat_dir is not provided"
+                )
+            feat_file = str(Path(feat_dir) / f"{stem}.npy")
+        else:
+            # Fallback: treat as stem-like entry and resolve from feat_dir
+            if not feat_dir:
+                raise ValueError(
+                    "feature list contains non-.npy/.json entries but feat_dir is not provided"
+                )
+            feat_file = str(Path(feat_dir) / f"{stem}.npy")
+        if stem in seen:
+            continue
+        seen.add(stem)
+        entries.append((stem, feat_file))
+    return entries
+
+
 def load_model(cfg: dict, ckpt_path: str, device_index: int, use_cuda: bool) -> nn.Module:
     """Load ActionFormer model from config and checkpoint."""
     model = make_meta_arch(cfg["model_name"], **cfg["model"])
@@ -179,6 +216,8 @@ def main(args):
     cfg = load_config(args.config)
     id_to_label = _load_combined_id_to_label(cfg)
     print(f"[Inference] Loaded config: {cfg['dataset_name']}")
+    if not args.feature_list_txt and not args.feat_dir:
+        raise ValueError("Either --feat-dir or --feature-list-txt must be provided")
 
     _ = fix_random_seed(0, include_cuda=torch.cuda.is_available())
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
@@ -188,12 +227,24 @@ def main(args):
     model = load_model(cfg, args.ckpt, args.device, torch.cuda.is_available())
     print("[Inference] Model loaded and set to eval mode")
 
-    # Get video IDs
-    if args.video_ids:
-        video_ids = args.video_ids
+    # Resolve target feature entries
+    if args.feature_list_txt:
+        feature_entries = _load_feature_entries_from_txt(args.feature_list_txt, args.feat_dir)
+        if args.video_ids:
+            allow = set(args.video_ids)
+            feature_entries = [(vid, f) for vid, f in feature_entries if vid in allow]
     else:
-        video_ids = get_video_ids_from_dir(args.feat_dir)
-    print(f"[Inference] Found {len(video_ids)} videos to process")
+        if args.video_ids:
+            feature_entries = [
+                (video_id, os.path.join(args.feat_dir, f"{video_id}.npy"))
+                for video_id in args.video_ids
+            ]
+        else:
+            feature_entries = [
+                (video_id, os.path.join(args.feat_dir, f"{video_id}.npy"))
+                for video_id in get_video_ids_from_dir(args.feat_dir)
+            ]
+    print(f"[Inference] Found {len(feature_entries)} videos to process")
 
     # Inference loop
     results = {}
@@ -202,8 +253,7 @@ def main(args):
     fps = float(cfg["dataset"].get("default_fps", 10.0))
     downsample_rate = cfg["dataset"].get("downsample_rate", 1)
 
-    for video_id in video_ids:
-        feat_file = os.path.join(args.feat_dir, f"{video_id}.npy")
+    for video_id, feat_file in feature_entries:
         if not os.path.exists(feat_file):
             print(f"  [skip] {video_id}: feature file not found")
             continue
@@ -265,8 +315,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--feat-dir",
         type=str,
-        required=True,
+        default="",
         help="Directory containing .npy feature files",
+    )
+    parser.add_argument(
+        "--feature-list-txt",
+        type=str,
+        default="",
+        help="Text file with one .json/.npy path per line for inference targets",
     )
     parser.add_argument(
         "--output-json",

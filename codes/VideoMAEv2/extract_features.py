@@ -361,11 +361,15 @@ def extract_one(
     batch_i = 0
     if use_direct_batching:
         if cfg.decode_mode == "auto":
-            # Keep "full" only for very short clips. For 30s clips at 10fps
-            # (~300 frames), batch decode is substantially more stable/faster.
-            effective_decode_mode = (
-                "full" if ds.spec.num_target_frames <= cfg.auto_batch_threshold_frames else "batch"
-            )
+            # Keep "full" only for short clips when decode-time resize is enabled.
+            # If decode_resize_on_read is off, full mode has to CPU-resize the
+            # entire target-fps sequence at once and becomes preproc-bound.
+            if cfg.resize_mode == "squash" and not cfg.decode_resize_on_read:
+                effective_decode_mode = "batch"
+            else:
+                effective_decode_mode = (
+                    "full" if ds.spec.num_target_frames <= cfg.auto_batch_threshold_frames else "batch"
+                )
         else:
             effective_decode_mode = cfg.decode_mode
 

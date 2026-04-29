@@ -23,6 +23,7 @@ import datetime
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from pprint import pprint
@@ -102,6 +103,23 @@ def _validate_max_seq_len_for_model(cfg: dict) -> None:
             )
 
 
+def _load_stems_from_path_list(path_list_txt: str) -> list[str]:
+    stems: list[str] = []
+    for ln in Path(path_list_txt).read_text(encoding="utf-8").splitlines():
+        line = ln.strip()
+        if not line or line.startswith("#"):
+            continue
+        stems.append(Path(line).stem)
+    # de-duplicate while preserving order
+    out: list[str] = []
+    seen: set[str] = set()
+    for s in stems:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
 def main(args):
     """Main training function."""
 
@@ -120,6 +138,24 @@ def main(args):
         cfg["dataset"]["annot_dir"] = args.annot_dir
     if args.split_list_dir:
         cfg["dataset"]["split_list_dir"] = args.split_list_dir
+
+    split_list_tmpdir = None
+    if args.feature_list_txt:
+        stems = _load_stems_from_path_list(args.feature_list_txt)
+        if not stems:
+            raise ValueError(f"No valid entries in feature list: {args.feature_list_txt}")
+        split_list_tmpdir = tempfile.TemporaryDirectory(prefix="tal_split_from_featlist_")
+        split_train = Path(split_list_tmpdir.name) / "train.txt"
+        split_train.write_text(
+            "\n".join(f"{stem}.json" for stem in stems) + "\n",
+            encoding="utf-8",
+        )
+        cfg["train_split"] = ["train"]
+        cfg["dataset"]["split_list_dir"] = split_list_tmpdir.name
+        print(
+            f"[Training] Using feature-list based subset: {len(stems)} items "
+            f"(split_list_dir={split_list_tmpdir.name})"
+        )
 
     _apply_multiclass_overrides(cfg)
     pprint(cfg)
@@ -358,6 +394,12 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="Override dataset.split_list_dir",
+    )
+    parser.add_argument(
+        "--feature-list-txt",
+        type=str,
+        default="",
+        help="Text file with one .json/.npy path per line; used to build train subset",
     )
     parser.add_argument(
         "--ckpt-freq",

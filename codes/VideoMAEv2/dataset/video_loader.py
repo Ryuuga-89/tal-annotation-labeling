@@ -87,7 +87,10 @@ def _resize_squash(frames_uint8: torch.Tensor, size: int) -> torch.Tensor:
     """frames_uint8: [T, H, W, 3] uint8 tensor -> [3, T, size, size] float."""
     t = frames_uint8.to(torch.float32) / 255.0  # [T,H,W,3]
     t = t.permute(0, 3, 1, 2)  # [T,3,H,W]
-    t = F.interpolate(t, size=(size, size), mode="bilinear", align_corners=False)
+    # Skip interpolation when VideoReader already decoded at target resolution.
+    # This is the hot path for extraction and avoids a full-frame CPU resize pass.
+    if int(t.shape[-2]) != int(size) or int(t.shape[-1]) != int(size):
+        t = F.interpolate(t, size=(size, size), mode="bilinear", align_corners=False)
     t = t.permute(1, 0, 2, 3).contiguous()  # [3,T,size,size]
     return t
 
