@@ -105,7 +105,8 @@ class VideoChunkDataset(Dataset):
         start_target_idx = idx * self.cfg.stride
         video_tensor = self._get_video_tensor()
         clip = video_tensor[:, start_target_idx : start_target_idx + self.cfg.window_size]
-        return clip.contiguous(), idx
+        # Keep as a view to avoid an extra CPU copy per step; batching handles packing.
+        return clip, idx
 
 
 def collate_clips(items: list[tuple[torch.Tensor, int]]) -> ClipBatch:

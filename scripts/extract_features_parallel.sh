@@ -46,6 +46,7 @@ MAX_LIMIT="${MAX_LIMIT:-}"
 OUT_DIR="${OUT_DIR:-data/features/30s_mae_b_16_2}"
 CONFIG="${CONFIG:-codes/VideoMAEv2/configs/extract_vit_b.yaml}"
 OVERWRITE="${OVERWRITE:-}"
+LOG_DIR="${LOG_DIR:-$OUT_DIR/logs}"
 
 # 共通環境変数（実行時必須）
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/lustre/work/mt/.uv-cache}"
@@ -91,7 +92,7 @@ if (( NUM_SHARDS > NUM_GPUS )); then
   NUM_SHARDS=$NUM_GPUS
 fi
 
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR" "$LOG_DIR"
 
 # ============================================================================
 # ログ・ヘッダー
@@ -108,6 +109,7 @@ echo "Config: $CONFIG"
 echo "Batch Size: $BATCH_SIZE"
 echo "Num Workers: $NUM_WORKERS"
 echo "Output Dir: $OUT_DIR"
+echo "Log Dir: $LOG_DIR"
 echo ""
 echo "Annotation Root: $ANNOT_ROOT_DIR"
 echo "Video Root: $VIDEO_DATA_DIR"
@@ -132,6 +134,8 @@ for SHARD_ID in $(seq 0 $((NUM_SHARDS - 1))); do
   GPU_DEV="${GPU_ARRAY[$GPU_IDX]}"
 
   echo "[shard $SHARD_ID/$NUM_SHARDS] Launching on GPU $GPU_DEV..."
+  LOG_FILE="$LOG_DIR/shard$(printf '%02d' "$SHARD_ID")of$(printf '%02d' "$NUM_SHARDS").log"
+  echo "[shard $SHARD_ID/$NUM_SHARDS] log: $LOG_FILE"
 
   # CLI パラメータ構築
   ARGS=(
@@ -157,7 +161,13 @@ for SHARD_ID in $(seq 0 $((NUM_SHARDS - 1))); do
   (
     export CUDA_VISIBLE_DEVICES="$GPU_DEV"
     export PYTHONPATH="codes${PYTHONPATH:+:${PYTHONPATH}}"
-    uv run --no-sync python -m VideoMAEv2.extract_features "${ARGS[@]}"
+    {
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] shard=$SHARD_ID gpu=$GPU_DEV start"
+      uv run --no-sync python -m VideoMAEv2.extract_features "${ARGS[@]}"
+      rc=$?
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] shard=$SHARD_ID gpu=$GPU_DEV end rc=$rc"
+      exit $rc
+    } >"$LOG_FILE" 2>&1
   ) &
 
   PIDS+=($!)
