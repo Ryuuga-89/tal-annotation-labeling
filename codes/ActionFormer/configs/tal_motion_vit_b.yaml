@@ -4,7 +4,8 @@
 # Sequence length budget:
 #   30s @ 10fps, window=16, stride=2 -> num_steps = 143
 #   10s @ 10fps                       -> num_steps = 43
-# max_seq_len 192 covers 30s with margin and is a power-friendly multiple of 32.
+# With n_mha_win_size=9 and backbone_arch[-1]=4, ActionFormer requires
+# max_seq_len to be divisible by 128. Use 256 to satisfy this constraint.
 
 dataset_name: tal_motion
 train_split: ['train']
@@ -15,13 +16,13 @@ dataset: {
   feat_folder: data/features/30s_mae_b_16_2,
   file_prefix: ~,
   file_ext: .npy,
-  num_classes: 1,                    # class-agnostic; aux_type is auxiliary
+  num_classes: 164,                  # combined_label classes from vocab (incl. OTHER)
   input_dim: 768,
   feat_stride: 2,                    # frames per feat step (= extractor stride)
   num_frames: 16,                    # frames per feat clip (= window)
   default_fps: 10.0,                 # target_fps used at extraction
   downsample_rate: 1,
-  max_seq_len: 192,
+  max_seq_len: 256,
   trunc_thresh: 0.5,
   crop_ratio: [0.9, 1.0],
   force_upsampling: False,
@@ -29,6 +30,9 @@ dataset: {
   annot_dir: /raid/containers/enroot/data/b100/ft_fact_videos/annot/30s_chunks_action_31detail_2,
   split_list_dir: data/splits/v1,
   aux_vocab_file: data/aux_stats/v1/aux_vocab.json,
+  label_mode: combined,              # binary | combined
+  combined_vocab_file: data/aux_stats/v1/combined_vocab_merged.json,
+  merge_combined_labels: True,
   aux_fields: ['body_part', 'action_type', 'grip_or_contact', 'speed_or_force', 'posture_change'],
   skip_no_actions: True,
   tiou_thresholds: [0.3, 0.4, 0.5, 0.6, 0.7],
@@ -96,7 +100,7 @@ test_cfg: {
   nms_method: soft,
   nms_sigma: 0.5,
   duration_thresh: 0.05,
-  multiclass_nms: False,         # single class
+  multiclass_nms: True,
   voting_thresh: 0.7,
 }
 

@@ -17,7 +17,12 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+import decord
 from decord import VideoReader, cpu
+
+# AVION-style optimization: keep decoding output as torch tensor on CPU,
+# avoiding repeated numpy->torch conversions.
+decord.bridge.set_bridge("torch")
 
 
 @dataclass
@@ -78,10 +83,9 @@ def _target_to_source_indices(
     return src_idx
 
 
-def _resize_squash(frames_uint8: np.ndarray, size: int) -> torch.Tensor:
-    """frames_uint8: [T, H, W, 3] uint8 → tensor [3, T, size, size] float in [0,1]."""
-    # Move to torch float CHW (per-frame independent resize via interpolate).
-    t = torch.from_numpy(frames_uint8).to(torch.float32) / 255.0  # [T,H,W,3]
+def _resize_squash(frames_uint8: torch.Tensor, size: int) -> torch.Tensor:
+    """frames_uint8: [T, H, W, 3] uint8 tensor -> [3, T, size, size] float."""
+    t = frames_uint8.to(torch.float32) / 255.0  # [T,H,W,3]
     t = t.permute(0, 3, 1, 2)  # [T,3,H,W]
     t = F.interpolate(t, size=(size, size), mode="bilinear", align_corners=False)
     t = t.permute(1, 0, 2, 3).contiguous()  # [3,T,size,size]
@@ -89,9 +93,9 @@ def _resize_squash(frames_uint8: np.ndarray, size: int) -> torch.Tensor:
 
 
 def _resize_shortside_then_center_crop(
-    frames_uint8: np.ndarray, size: int
+    frames_uint8: torch.Tensor, size: int
 ) -> torch.Tensor:
-    t = torch.from_numpy(frames_uint8).to(torch.float32) / 255.0  # [T,H,W,3]
+    t = frames_uint8.to(torch.float32) / 255.0  # [T,H,W,3]
     t = t.permute(0, 3, 1, 2)  # [T,3,H,W]
     _, _, h, w = t.shape
     if h <= w:
@@ -115,15 +119,25 @@ def load_target_fps_frames(
     start_target_idx: int,
     num_frames: int,
     vr: VideoReader | None = None,
-) -> np.ndarray:
+) -> torch.Tensor:
     """Load `num_frames` consecutive frames on the target-fps timeline.
 
-    The returned array keeps the original uint8 layout [T, H, W, 3].
+    The returned tensor keeps the original uint8 layout [T, H, W, 3].
     """
     if vr is None:
         vr = VideoReader(str(spec.path), num_threads=1, ctx=cpu(0))
     src_idx = _target_to_source_indices(spec, start_target_idx, num_frames)
-    return vr.get_batch(src_idx).asnumpy()
+    # Decord can become unstable/slow for very large index arrays on some videos.
+    # Read in chunks to bound per-call latency and memory.
+    chunk_size = 256
+    if src_idx.shape[0] <= chunk_size:
+        return vr.get_batch(src_idx)
+
+    parts = []
+    for i in range(0, src_idx.shape[0], chunk_size):
+        part = vr.get_batch(src_idx[i : i + chunk_size])
+        parts.append(part)
+    return torch.cat(parts, dim=0)
 
 
 def load_video_at_target_fps(

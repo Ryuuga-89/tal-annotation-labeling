@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from decord import VideoReader, cpu
 from torch.utils.data import Dataset
 
@@ -35,6 +37,8 @@ class _DatasetConfig:
     stride: int
     input_size: int
     resize_mode: str
+    decode_threads: int
+    decode_resize_on_read: bool
 
 
 class VideoChunkDataset(Dataset):
@@ -57,6 +61,8 @@ class VideoChunkDataset(Dataset):
         stride: int = 2,
         input_size: int = 224,
         resize_mode: str = "squash",
+        decode_threads: int = 2,
+        decode_resize_on_read: bool = True,
         spec: VideoSpec | None = None,
     ):
         self.video_path = Path(video_path)
@@ -66,6 +72,8 @@ class VideoChunkDataset(Dataset):
             stride=stride,
             input_size=input_size,
             resize_mode=resize_mode,
+            decode_threads=decode_threads,
+            decode_resize_on_read=decode_resize_on_read,
         )
         self.spec = spec or probe_video(self.video_path, target_fps=target_fps)
         self._n_steps = self.spec.num_steps(window_size=window_size, stride=stride)
@@ -81,7 +89,22 @@ class VideoChunkDataset(Dataset):
 
     def _get_reader(self) -> VideoReader:
         if self._vr is None:
-            self._vr = VideoReader(str(self.video_path), num_threads=1, ctx=cpu(0))
+            # For squash mode we can decode directly at model resolution and skip
+            # expensive CPU-side interpolation of full-resolution frames.
+            if self.cfg.resize_mode == "squash" and self.cfg.decode_resize_on_read:
+                self._vr = VideoReader(
+                    str(self.video_path),
+                    num_threads=max(1, int(self.cfg.decode_threads)),
+                    width=int(self.cfg.input_size),
+                    height=int(self.cfg.input_size),
+                    ctx=cpu(0),
+                )
+            else:
+                self._vr = VideoReader(
+                    str(self.video_path),
+                    num_threads=max(1, int(self.cfg.decode_threads)),
+                    ctx=cpu(0),
+                )
         return self._vr
 
     def _get_video_tensor(self) -> torch.Tensor:
@@ -93,6 +116,58 @@ class VideoChunkDataset(Dataset):
                 vr=self._get_reader(),
             )
         return self._video_tensor
+
+    def release_cache(self) -> None:
+        """Release cached reader/tensor eagerly to avoid resource buildup."""
+        self._video_tensor = None
+        self._vr = None
+
+    def batch_clips(self, start_step: int, end_step: int) -> torch.Tensor:
+        """Return clips for step range [start_step, end_step) as [B,3,T,H,W].
+
+        This decodes only frames needed by the batch window span instead of
+        materializing the full target-fps video tensor.
+        """
+        if start_step < 0 or end_step > self._n_steps or end_step <= start_step:
+            raise ValueError(f"invalid step range: {start_step}:{end_step} for n_steps={self._n_steps}")
+
+        # Fallback path for non-squash mode: keep behavior simple/correct.
+        if self.cfg.resize_mode != "squash":
+            return self.windowed_clips()[start_step:end_step]
+
+        t_start = start_step * self.cfg.stride
+        t_end = (end_step - 1) * self.cfg.stride + self.cfg.window_size  # exclusive
+
+        target_idx = np.arange(t_start, t_end, dtype=np.float64)
+        if self.spec.src_fps <= 0:
+            src_idx = target_idx.astype(np.int64)
+        else:
+            src_idx = np.round(target_idx * (self.spec.src_fps / self.spec.target_fps)).astype(np.int64)
+        src_idx = np.clip(src_idx, 0, self.spec.src_num_frames - 1)
+
+        # Decode unique source frames once, then remap to target timeline.
+        unique_src, inverse = np.unique(src_idx, return_inverse=True)
+        frames = self._get_reader().get_batch(unique_src)  # [U,H,W,3] uint8 torch tensor
+        t = frames.to(torch.float32) / 255.0  # [U,H,W,3]
+        t = t.permute(0, 3, 1, 2)  # [U,3,H,W]
+        if not (
+            self.cfg.decode_resize_on_read
+            and int(t.shape[-2]) == int(self.cfg.input_size)
+            and int(t.shape[-1]) == int(self.cfg.input_size)
+        ):
+            t = F.interpolate(
+                t,
+                size=(self.cfg.input_size, self.cfg.input_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        # VideoMAE normalization
+        t = (t - 0.5) / 0.5
+
+        seq = t[inverse]  # [L,3,H,W], L == (t_end - t_start)
+        seq = seq.permute(1, 0, 2, 3).contiguous()  # [3,L,H,W]
+        clips = seq.unfold(1, self.cfg.window_size, self.cfg.stride).permute(1, 0, 4, 2, 3)
+        return clips
 
     def windowed_clips(self) -> torch.Tensor:
         """Return all sliding-window clips as a view of shape [N, 3, T, H, W]."""

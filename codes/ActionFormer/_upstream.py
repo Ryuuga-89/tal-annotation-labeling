@@ -9,6 +9,7 @@ Importing this module is a no-op past the first time; idempotent.
 from __future__ import annotations
 
 import importlib
+
 import sys
 from pathlib import Path
 

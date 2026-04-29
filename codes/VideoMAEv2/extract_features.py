@@ -13,8 +13,10 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import random
 import sys
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -96,6 +98,8 @@ class ExtractConfig:
     limit: int | None = None
     overwrite: bool = False
     fail_on_missing_video: bool = False
+    shuffle: bool = False
+    seed: int = 42
 
     # Sharding
     shard_id: int = 0
@@ -104,8 +108,29 @@ class ExtractConfig:
     # Housekeeping
     # Do GC / empty_cache every N batches (0 disables; end-of-video cleanup still runs)
     cleanup_interval_batches: int = 0
+    # Do GC / empty_cache every N videos in the outer loop (0 disables).
+    cleanup_interval_videos: int = 0
     # Print progress metrics every N videos (0 disables extra logs)
     progress_log_interval_videos: int = 20
+    # Decord decode threads per video
+    decode_threads: int = 2
+    # Decode at input resolution for squash mode (faster, less memory)
+    decode_resize_on_read: bool = True
+    # "full": decode full target-fps video once, then unfold windows.
+    # "batch": decode only frames needed per mini-batch.
+    # "auto": use full for short clips, batch for long clips.
+    decode_mode: str = "auto"
+    # Threshold for decode_mode=auto. If num_target_frames is greater than this,
+    # switch to batch decode to avoid expensive full-video materialization.
+    auto_batch_threshold_frames: int = 320
+    # If true on CUDA, choose batch size from available VRAM.
+    auto_batch_size: bool = False
+    # Upper bound for effective batch size when using decode_mode=batch.
+    # Large values can increase decode latency without improving throughput.
+    max_batch_size_batch_decode: int = 32
+    # If true, insert cuda synchronize around timed blocks for accurate stage
+    # profiling. This can reduce throughput; keep disabled for production runs.
+    sync_cuda_timing: bool = False
 
 
 def _load_config(path: str | None) -> dict:
@@ -155,10 +180,20 @@ def parse_args(argv: list[str] | None = None) -> ExtractConfig:
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--fail-on-missing-video", action="store_true")
+    p.add_argument("--shuffle", action="store_true", help="Shuffle processing order before sharding")
+    p.add_argument("--seed", type=int, default=None, help="Random seed used with --shuffle")
     p.add_argument("--shard-id", type=int, default=None)
     p.add_argument("--num-shards", type=int, default=None)
     p.add_argument("--cleanup-interval-batches", type=int, default=None)
+    p.add_argument("--cleanup-interval-videos", type=int, default=None)
     p.add_argument("--progress-log-interval-videos", type=int, default=None)
+    p.add_argument("--decode-threads", type=int, default=None)
+    p.add_argument("--no-decode-resize-on-read", action="store_true")
+    p.add_argument("--decode-mode", type=str, default=None, choices=["auto", "full", "batch"])
+    p.add_argument("--auto-batch-threshold-frames", type=int, default=None)
+    p.add_argument("--auto-batch-size", action="store_true")
+    p.add_argument("--max-batch-size-batch-decode", type=int, default=None)
+    p.add_argument("--sync-cuda-timing", action="store_true")
 
     args = p.parse_args(argv)
     file_cfg = _load_config(args.config)
@@ -185,10 +220,20 @@ def parse_args(argv: list[str] | None = None) -> ExtractConfig:
         "limit": args.limit,
         "overwrite": True if args.overwrite else None,
         "fail_on_missing_video": True if args.fail_on_missing_video else None,
+        "shuffle": True if args.shuffle else None,
+        "seed": args.seed,
         "shard_id": args.shard_id,
         "num_shards": args.num_shards,
         "cleanup_interval_batches": args.cleanup_interval_batches,
+        "cleanup_interval_videos": args.cleanup_interval_videos,
         "progress_log_interval_videos": args.progress_log_interval_videos,
+        "decode_threads": args.decode_threads,
+        "decode_resize_on_read": False if args.no_decode_resize_on_read else None,
+        "decode_mode": args.decode_mode,
+        "auto_batch_threshold_frames": args.auto_batch_threshold_frames,
+        "auto_batch_size": True if args.auto_batch_size else None,
+        "max_batch_size_batch_decode": args.max_batch_size_batch_decode,
+        "sync_cuda_timing": True if args.sync_cuda_timing else None,
     }
 
     cfg = ExtractConfig()
@@ -218,6 +263,25 @@ def _make_step_time_index(num_steps: int, target_fps: float, stride: int, window
         [i * stride / target_fps, (i * stride + window_size) / target_fps]
         for i in range(num_steps)
     ]
+
+
+def _maybe_cuda_sync(device: torch.device, enabled: bool) -> None:
+    if enabled and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _auto_batch_size_for_device(device: torch.device, fallback: int) -> int:
+    if device.type != "cuda":
+        return fallback
+    props = torch.cuda.get_device_properties(device)
+    total_gb = props.total_memory / (1024 ** 3)
+    if total_gb >= 70:
+        return max(fallback, 64)
+    if total_gb >= 38:
+        return max(fallback, 48)
+    if total_gb >= 22:
+        return max(fallback, 32)
+    return fallback
 
 
 def extract_one(
@@ -254,6 +318,8 @@ def extract_one(
         stride=cfg.stride,
         input_size=cfg.input_size,
         resize_mode=cfg.resize_mode,
+        decode_threads=cfg.decode_threads,
+        decode_resize_on_read=cfg.decode_resize_on_read,
     )
     t_ds_end = time.perf_counter()
     t_load = t_ds_end - t_ds_start
@@ -294,47 +360,84 @@ def extract_one(
 
     batch_i = 0
     if use_direct_batching:
-        # Fast path for num_workers=0: avoid per-item __getitem__/stack overhead.
-        all_clips = ds.windowed_clips()  # [N, 3, T, H, W] as a view
-        for start in range(0, num_steps, cfg.batch_size):
-            end = min(start + cfg.batch_size, num_steps)
+        if cfg.decode_mode == "auto":
+            # Keep "full" only for very short clips. For 30s clips at 10fps
+            # (~300 frames), batch decode is substantially more stable/faster.
+            effective_decode_mode = (
+                "full" if ds.spec.num_target_frames <= cfg.auto_batch_threshold_frames else "batch"
+            )
+        else:
+            effective_decode_mode = cfg.decode_mode
 
+        effective_batch_size = cfg.batch_size
+        if effective_decode_mode == "batch":
+            effective_batch_size = min(cfg.batch_size, cfg.max_batch_size_batch_decode)
+
+        if effective_decode_mode == "full":
+            # Stable path for short clips (our 30s chunks): decode once and unfold.
             t_prep_start = time.perf_counter()
-            clips_cpu = all_clips[start:end]
-            idx = np.arange(start, end, dtype=np.int64)
+            all_clips = ds.windowed_clips()  # [N, 3, T, H, W]
+            t_prep_end = time.perf_counter()
+            t_preproc += (t_prep_end - t_prep_start)
+            batch_iter = (
+                (s, min(s + effective_batch_size, num_steps))
+                for s in range(0, num_steps, effective_batch_size)
+            )
+        else:
+            # Lower memory path: decode only frames needed per batch.
+            all_clips = None
+            batch_iter = (
+                (s, min(s + effective_batch_size, num_steps))
+                for s in range(0, num_steps, effective_batch_size)
+            )
+
+        for start, end in batch_iter:
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+            t_prep_start = time.perf_counter()
+            if effective_decode_mode == "full":
+                clips_cpu = all_clips[start:end]
+            else:
+                clips_cpu = ds.batch_clips(start, end)  # [B, 3, T, H, W]
             clips = clips_cpu.to(device, non_blocking=True)
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
             t_prep_end = time.perf_counter()
             t_preproc += (t_prep_end - t_prep_start)
 
             with torch.inference_mode():
                 if autocast_enabled:
                     with torch.autocast(device_type="cuda", dtype=dtype):
+                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
                         t_inf_start = time.perf_counter()
                         out = backbone(clips)
+                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
                         t_inf_end = time.perf_counter()
                 else:
+                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
                     t_inf_start = time.perf_counter()
                     out = backbone(clips)
+                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
                     t_inf_end = time.perf_counter()
             t_infer += (t_inf_end - t_inf_start)
 
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
             t_post_start = time.perf_counter()
-            out_cpu = out.detach().to("cpu")
+            out_cpu = out.detach()
             if save_dtype == np.float16:
-                feats[idx] = out_cpu.to(torch.float16).numpy()
+                feats[start:end] = out_cpu.to(torch.float16).cpu().numpy()
             else:
-                feats[idx] = out_cpu.to(torch.float32).numpy()
+                feats[start:end] = out_cpu.to(torch.float32).cpu().numpy()
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
             t_post_end = time.perf_counter()
             t_postproc += (t_post_end - t_post_start)
 
-            del clips_cpu, clips, out, out_cpu, idx
+            del clips_cpu, clips, out, out_cpu
             batch_i += 1
             if cfg.cleanup_interval_batches and (batch_i % cfg.cleanup_interval_batches == 0):
                 gc.collect()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-
-        del all_clips
+        if all_clips is not None:
+            del all_clips
     else:
         # We'll measure time spent waiting for the batch (this includes collate/preprocess)
         batch_fetch_start = time.perf_counter()
@@ -343,30 +446,38 @@ def extract_one(
             t_preproc += (batch_fetched - batch_fetch_start)
 
             # move clips to device (non-blocking attempt)
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
             t_move_start = time.perf_counter()
             clips = batch.clips.to(device, non_blocking=True)
             idx = batch.step_idx.numpy()
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
             t_move_end = time.perf_counter()
             t_preproc += (t_move_end - t_move_start)
 
             with torch.inference_mode():
                 if autocast_enabled:
                     with torch.autocast(device_type="cuda", dtype=dtype):
+                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
                         t_inf_start = time.perf_counter()
                         out = backbone(clips)
+                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
                         t_inf_end = time.perf_counter()
                 else:
+                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
                     t_inf_start = time.perf_counter()
                     out = backbone(clips)
+                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
                     t_inf_end = time.perf_counter()
             t_infer += (t_inf_end - t_inf_start)
 
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
             t_post_start = time.perf_counter()
             out_cpu = out.detach().to("cpu")
             if save_dtype == np.float16:
                 feats[idx] = out_cpu.to(torch.float16).numpy()
             else:
                 feats[idx] = out_cpu.to(torch.float32).numpy()
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
             t_post_end = time.perf_counter()
             t_postproc += (t_post_end - t_post_start)
 
@@ -410,11 +521,9 @@ def extract_one(
     t_save_end = time.perf_counter()
     t_save = t_save_end - t_save_start
 
-    # end-of-video cleanup (safe + effective)
+    # end-of-video cleanup (avoid forced per-video GC/empty_cache: expensive)
+    ds.release_cache()
     del ds, feats, loader
-    gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
 
     elapsed = time.perf_counter() - t_start
     # Return detailed stage timings for profiling
@@ -483,6 +592,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if cfg.limit is not None:
         json_paths = json_paths[: cfg.limit]
+    if cfg.shuffle:
+        rng = random.Random(cfg.seed)
+        rng.shuffle(json_paths)
+        print(
+            f"[shuffle] randomized order enabled (seed={cfg.seed}); applied before sharding",
+            flush=True,
+        )
     if cfg.num_shards < 1:
         raise SystemExit(f"num_shards must be >= 1 (got {cfg.num_shards})")
     if not (0 <= cfg.shard_id < cfg.num_shards):
@@ -495,6 +611,27 @@ def main(argv: list[str] | None = None) -> int:
             f"[shard {cfg.shard_id}/{cfg.num_shards}] processing {len(json_paths)} of {total_in_split} files",
             flush=True,
         )
+    # When not overwriting, pre-filter already materialized items so tqdm "it/s"
+    # reflects actual extraction throughput instead of mixing in near-zero-cost
+    # skipped entries.
+    if not cfg.overwrite:
+        pending = []
+        skipped_existing = 0
+        for jp in json_paths:
+            stem = jp.stem
+            out_npy = out_dir / f"{stem}.npy"
+            out_meta = out_dir / f"{stem}.json"
+            if out_npy.exists() and out_meta.exists():
+                skipped_existing += 1
+                continue
+            pending.append(jp)
+        if skipped_existing > 0:
+            print(
+                f"[prefilter] existing outputs skipped before loop: "
+                f"{skipped_existing}/{len(json_paths)}",
+                flush=True,
+            )
+        json_paths = pending
     if not json_paths:
         raise SystemExit(f"no annotation json files under {annot_dir}")
 
@@ -515,6 +652,18 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.device == "cuda":
         gpu_msg = f" (GPU {cfg.gpu_id})" if cfg.gpu_id is not None else " (default GPU)"
         print(f"[device] using {device}{gpu_msg}", flush=True)
+        # Throughput-oriented defaults for inference-only extraction.
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        if cfg.auto_batch_size:
+            old_bs = cfg.batch_size
+            cfg.batch_size = _auto_batch_size_for_device(device, cfg.batch_size)
+            if cfg.batch_size != old_bs:
+                print(
+                    f"[tune] auto batch size enabled: {old_bs} -> {cfg.batch_size}",
+                    flush=True,
+                )
 
     backbone = build_backbone(
         cfg.model_name,
@@ -549,6 +698,7 @@ def main(argv: list[str] | None = None) -> int:
     postproc_acc = 0.0
     save_acc = 0.0
     timing_count = 0
+    recent_ok = deque(maxlen=32)  # (elapsed_sec, num_steps)
     for i, jp in enumerate(progress, start=1):
         try:
             video_path, rec = pair_video_with_annotation(video_dir, jp, suffix=cfg.video_suffix)
@@ -580,17 +730,27 @@ def main(argv: list[str] | None = None) -> int:
             postproc_acc += float(res.get("t_postproc", 0.0))
             save_acc += float(res.get("t_save", 0.0))
             timing_count += 1
+            recent_ok.append((float(res.get("elapsed_sec", 0.0)), int(res.get("num_steps", 0))))
 
         elapsed = time.perf_counter() - shard_started
         videos_per_sec = i / elapsed if elapsed > 0 else 0.0
         avg_sec_per_video = elapsed / i if i > 0 else 0.0
         eta_sec = (len(json_paths) - i) / videos_per_sec if videos_per_sec > 0 else 0.0
         clip_per_sec = ok_steps_acc / elapsed if elapsed > 0 else 0.0
+        infer_clip_per_sec = ok_steps_acc / infer_acc if infer_acc > 0 else 0.0
+        if recent_ok:
+            recent_elapsed = sum(x[0] for x in recent_ok)
+            recent_steps = sum(x[1] for x in recent_ok)
+            recent_clip_per_sec = recent_steps / recent_elapsed if recent_elapsed > 0 else 0.0
+        else:
+            recent_clip_per_sec = 0.0
 
         progress.set_postfix(
             last=res.get("status", "?"),
             vps=f"{videos_per_sec:.3f}",
             cps=f"{clip_per_sec:.1f}",
+            cps_recent=f"{recent_clip_per_sec:.1f}",
+            cps_infer=f"{infer_clip_per_sec:.1f}",
             eta_min=f"{eta_sec / 60.0:.1f}",
         )
 
@@ -600,11 +760,17 @@ def main(argv: list[str] | None = None) -> int:
                 f"[metrics shard {cfg.shard_id}/{cfg.num_shards}] "
                 f"done={i}/{len(json_paths)} avg_s_per_video={avg_sec_per_video:.2f} "
                 f"videos_per_min={videos_per_sec * 60.0:.2f} clip_per_sec={clip_per_sec:.2f} "
+                f"clip_per_sec_recent={recent_clip_per_sec:.2f} clip_per_sec_infer={infer_clip_per_sec:.2f} "
                 f"eta_min={eta_sec / 60.0:.1f} "
                 f"stage_avg_sec(load={load_acc / denom:.2f}, preproc={preproc_acc / denom:.2f}, "
                 f"infer={infer_acc / denom:.2f}, postproc={postproc_acc / denom:.2f}, save={save_acc / denom:.2f})",
                 flush=True,
             )
+
+        if cfg.cleanup_interval_videos and (i % cfg.cleanup_interval_videos == 0):
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     summary["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     index_name = (

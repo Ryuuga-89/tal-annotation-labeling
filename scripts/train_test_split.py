@@ -1,0 +1,4 @@
+***
+train_test_split.pyは、featureディレクトリと分割比率ratioをコマンドライン引数で受け取り、
+featureディレクトリ内にあるファイルを分割比率ratioに従って分割して、trainデータセットと
+

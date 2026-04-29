@@ -1,6 +1,6 @@
 # codes/ActionFormer
 
-Phase 2b: ActionFormer ベースの class-agnostic TAL を、本タスクのデータ
+Phase 2b: ActionFormer ベースの TAL を、本タスクのデータ
 (VideoMAE V2 ViT-B 特徴) 上で学習する。**upstream の `repos/ActionFormer/`
 は変更せず**、必要な追加分だけ本ディレクトリに置く。
 
@@ -26,9 +26,8 @@ codes/ActionFormer/
 ## 設計方針
 
 - **メインの分類 head は class-agnostic (num_classes=1)**: 区間検出の品質に集中。
-- **補助 head (multi-task)**: `body_part / action_type / grip_or_contact /
-  speed_or_force / posture_change` を per-segment 分類として学習。
-  Phase 3 (caption) への conditioning に流用できる。
+- **caption 生成は LLM 側で実施**: ActionFormer は区間推定を主担当。
+- **補助 head は将来拡張**: `body_part / action_type` 等を使う multi-task は必要時に追加。
 - 時間軸: `feat_stride=2 / num_frames=16 / fps=10` → 1 step = 0.2 秒。
   `max_seq_len=192` は 30s 動画 (~143 step) に余裕を持って収まる。
 - regression range は step 単位で短時間〜長時間をカバー

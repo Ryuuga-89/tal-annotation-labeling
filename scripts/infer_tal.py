@@ -19,7 +19,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
@@ -34,7 +33,31 @@ if str(_PKG_PARENT) not in sys.path:
 from ActionFormer import _upstream  # noqa: F401 -- mount actionformer_libs
 from actionformer_libs.core.config import load_config  # noqa: E402
 from actionformer_libs.modeling import make_meta_arch  # noqa: E402
-from actionformer_libs.utils import nms_1d_cpu  # noqa: E402, F401
+from actionformer_libs.utils import fix_random_seed  # noqa: E402
+
+
+def _load_combined_id_to_label(cfg: dict) -> dict[int, str]:
+    dataset_cfg = cfg.get("dataset", {})
+    if dataset_cfg.get("label_mode", "binary") != "combined":
+        return {}
+    vocab_file = dataset_cfg.get("combined_vocab_file", "")
+    if not vocab_file:
+        raise ValueError("label_mode=combined requires dataset.combined_vocab_file")
+    p = Path(vocab_file)
+    if not p.exists():
+        raise FileNotFoundError(f"combined_vocab_file not found: {p}")
+    payload = json.loads(p.read_text(encoding="utf-8"))
+    label_to_id = payload.get("combined_label", {}).get("label_to_id", {})
+    if not label_to_id:
+        raise ValueError(f"Invalid combined vocab (combined_label.label_to_id): {p}")
+    num_classes = max(label_to_id.values()) + 1
+    cfg["dataset"]["num_classes"] = num_classes
+    cfg["model"]["num_classes"] = num_classes
+    cfg["test_cfg"]["multiclass_nms"] = True
+    cfg["model"]["test_cfg"]["multiclass_nms"] = True
+    id_to_label = {v: k for k, v in label_to_id.items()}
+    print(f"[Inference] Combined multiclass mode enabled (num_classes={num_classes})")
+    return id_to_label
 
 
 def get_video_ids_from_dir(feat_dir: str) -> list[str]:
@@ -46,20 +69,23 @@ def get_video_ids_from_dir(feat_dir: str) -> list[str]:
     return stems
 
 
-def load_model(cfg: dict, ckpt_path: str, device: str) -> nn.Module:
+def load_model(cfg: dict, ckpt_path: str, device_index: int, use_cuda: bool) -> nn.Module:
     """Load ActionFormer model from config and checkpoint."""
     model = make_meta_arch(cfg["model_name"], **cfg["model"])
-    model = nn.DataParallel(model, device_ids=[int(device)])
-    model.to(device)
+    if use_cuda:
+        model = nn.DataParallel(model, device_ids=[device_index])
 
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     print(f"Loading checkpoint: {ckpt_path}")
-    checkpoint = torch.load(
-        ckpt_path,
-        map_location=lambda storage, loc: storage.cuda(int(device)),
-    )
+    if use_cuda:
+        checkpoint = torch.load(
+            ckpt_path,
+            map_location=lambda storage, loc: storage.cuda(device_index),
+        )
+    else:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
     # Try loading EMA model first, fall back to regular state_dict
     if "state_dict_ema" in checkpoint:
         print("  -> Loading EMA model state")
@@ -89,169 +115,55 @@ def load_features(feat_file: str, downsample_rate: int = 1) -> tuple[np.ndarray,
     return feats, downsample_rate
 
 
-def nms_1d_cpu_wrapper(
-    detections: list[dict],
-    nms_thresh: float,
-) -> list[dict]:
-    """Apply NMS on 1D detections using actionformer_libs.utils.nms_1d_cpu.
-
-    Args:
-        detections: List of dicts with 'start_time', 'end_time', 'score'.
-        nms_thresh: IoU threshold for NMS.
-
-    Returns:
-        Filtered detections after NMS.
-    """
-    if not detections:
-        return []
-
-    # Convert to (N, 3) array: [start, end, score]
-    dets = np.asarray(
-        [[d["start_time"], d["end_time"], d["score"]] for d in detections],
-        dtype=np.float32,
-    )
-
-    # nms_1d_cpu expects (N, 2) for positions and (N,) for scores separately
-    # Let's use a simple IoU-based NMS instead (ActionFormer's NMS is 2D)
-    keep = soft_nms_1d(dets, nms_thresh)
-    return [detections[i] for i in keep]
-
-
-def soft_nms_1d(dets: np.ndarray, iou_thresh: float) -> list[int]:
-    """Soft-NMS for 1D temporal segments.
-
-    Args:
-        dets: (N, 3) array [start, end, score]
-        iou_thresh: IoU threshold
-
-    Returns:
-        List of indices to keep
-    """
-    if dets.size == 0:
-        return []
-
-    dets = dets.copy()
-    keep = []
-
-    # Sort by score descending
-    order = np.argsort(-dets[:, 2])
-
-    while len(order) > 0:
-        i = order[0]
-        keep.append(i)
-
-        if len(order) == 1:
-            break
-
-        # Compute IoU with all remaining detections
-        start = np.maximum(dets[i, 0], dets[order[1:], 0])
-        end = np.minimum(dets[i, 1], dets[order[1:], 1])
-        inter = np.maximum(0, end - start)
-        union = (dets[i, 1] - dets[i, 0]) + (dets[order[1:], 1] - dets[order[1:], 0]) - inter
-        iou = inter / (union + 1e-6)
-
-        # Remove detections with high IoU
-        mask = iou <= iou_thresh
-        order = order[1:][mask]
-
-    return keep
-
-
 @torch.no_grad()
-def infer_batch(
+def infer_one_video(
     model: nn.Module,
-    feats_tensor: torch.Tensor,
+    video_id: str,
+    feats: np.ndarray,
+    duration: float,
     feat_stride: int,
     num_frames: int,
     fps: float,
     score_thresh: float = 0.3,
+    id_to_label: dict[int, str] | None = None,
 ) -> list[dict]:
-    """Run inference on a single sample and extract detections.
+    """Run inference on one video and return filtered detections."""
+    feats_tensor = torch.from_numpy(feats)
+    video_list = [{
+        "video_id": video_id,
+        "feats": feats_tensor,
+        "segments": torch.zeros((0, 2), dtype=torch.float32),
+        "labels": torch.zeros((0,), dtype=torch.int64),
+        "fps": float(fps),
+        "duration": float(duration),
+        "feat_stride": int(feat_stride),
+        "feat_num_frames": int(num_frames),
+    }]
 
-    Args:
-        model: ActionFormer model in eval mode
-        feats_tensor: (1, C, T) tensor (batch size = 1)
-        feat_stride: stride between feature frames
-        num_frames: window size used for feature extraction
-        fps: original video FPS
-        score_thresh: confidence threshold for filtering
-
-    Returns:
-        List of dicts: {'start_time', 'end_time', 'score'}
-    """
-    output = model(feats_tensor)
-    # output should be (B, 2, H) where:
-    #   output[:, 0, :] = regression (start/end offsets in feat-grid)
-    #   output[:, 1, :] = classification scores
-
-    # Assuming ActionFormer outputs (B, 2, T_out) or similar
-    # For class-agnostic, we expect 2 channels: regression + 1 class
-    # This depends on ActionFormer's head implementation.
-
-    # Typical ActionFormer output:
-    # - output['cls_logits']: (B, num_classes, T)
-    # - output['reg_preds']: (B, 2, T)  [start/end offsets]
-    # OR model outputs dict with these keys
-
-    if isinstance(output, dict):
-        cls_logits = output.get("cls_logits")  # (B, num_classes, T)
-        reg_preds = output.get("reg_preds")  # (B, 2, T)
-    else:
-        # Assume tuple: (cls_logits, reg_preds) or similar
-        # For class-agnostic, might be (B, 1, T) and (B, 2, T)
-        # This is model-dependent; adjust as needed
-        raise NotImplementedError(
-            "Model output type not recognized. Expecting dict with "
-            "'cls_logits' and 'reg_preds' keys."
-        )
-
-    if cls_logits is None or reg_preds is None:
+    output = model(video_list)
+    if not output:
         return []
-
-    # Extract from batch (assume B=1)
-    cls_logits = cls_logits[0]  # (num_classes, T)
-    reg_preds = reg_preds[0]  # (2, T)
-
-    # For class-agnostic (num_classes=1), cls_logits is (1, T)
-    scores = torch.sigmoid(cls_logits[0])  # (T,)
-
-    # Find peaks above threshold
-    mask = scores > score_thresh
-    if not mask.any():
-        return []
-
-    # Extract temporal positions
-    feat_offset = 0.5 * num_frames / feat_stride
-    indices = torch.where(mask)[0].cpu().numpy()
+    pred = output[0]
+    segs = pred["segments"].numpy()
+    scores = pred["scores"].numpy()
+    labels = pred["labels"].numpy() if "labels" in pred else None
     detections = []
-
-    for idx in indices:
-        # Regression prediction: [start_offset, end_offset]
-        start_offset, end_offset = reg_preds[:, idx].cpu().numpy()
-
-        # Convert to feature-grid coordinates (assuming regression is delta-based)
-        # If regression is absolute offsets from center:
-        start_grid = idx + start_offset
-        end_grid = idx + end_offset
-
-        # Clamp to valid range
-        start_grid = max(0, float(start_grid))
-        end_grid = min(float(cls_logits.shape[1]), float(end_grid))
-
-        # Convert from feature-grid to seconds
-        start_time = (start_grid + feat_offset) * feat_stride / fps
-        end_time = (end_grid + feat_offset) * feat_stride / fps
-
-        score = float(scores[idx])
-
-        detections.append(
-            {
-                "start_time": float(start_time),
-                "end_time": float(end_time),
-                "score": float(score),
-            }
-        )
-
+    for i in range(segs.shape[0]):
+        score = float(scores[i])
+        if score < score_thresh:
+            continue
+        start_time = max(0.0, float(segs[i, 0]))
+        end_time = min(float(duration), float(segs[i, 1]))
+        if end_time <= start_time:
+            continue
+        det = {"start_time": start_time, "end_time": end_time, "score": score}
+        if labels is not None:
+            class_id = int(labels[i])
+            det["class_id"] = class_id
+            if id_to_label is not None:
+                det["class_name"] = id_to_label.get(class_id, "UNKNOWN")
+        detections.append(det)
+    detections.sort(key=lambda x: x["score"], reverse=True)
     return detections
 
 
@@ -265,14 +177,15 @@ def main(args):
     if not os.path.isfile(args.config):
         raise FileNotFoundError(f"Config not found: {args.config}")
     cfg = load_config(args.config)
+    id_to_label = _load_combined_id_to_label(cfg)
     print(f"[Inference] Loaded config: {cfg['dataset_name']}")
 
-    # Determine device
+    _ = fix_random_seed(0, include_cuda=torch.cuda.is_available())
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     print(f"[Inference] Using device: {device}")
 
     # Load model
-    model = load_model(cfg, args.ckpt, args.device)
+    model = load_model(cfg, args.ckpt, args.device, torch.cuda.is_available())
     print("[Inference] Model loaded and set to eval mode")
 
     # Get video IDs
@@ -286,7 +199,7 @@ def main(args):
     results = {}
     feat_stride_base = cfg["dataset"].get("feat_stride", 2)
     num_frames = cfg["dataset"].get("num_frames", 16)
-    fps = cfg["dataset"].get("default_fps", 10.0)
+    fps = float(cfg["dataset"].get("default_fps", 10.0))
     downsample_rate = cfg["dataset"].get("downsample_rate", 1)
 
     for video_id in video_ids:
@@ -298,29 +211,29 @@ def main(args):
         # Load features
         feats, stride_mult = load_features(feat_file, downsample_rate)
         feat_stride = feat_stride_base * stride_mult
-        feats_tensor = torch.from_numpy(feats).unsqueeze(0).to(device)  # (1, C, T)
+        duration = (feats.shape[1] * feat_stride + 0.5 * num_frames) / fps
 
         # Run inference
-        detections = infer_batch(
+        detections = infer_one_video(
             model,
-            feats_tensor,
+            video_id,
+            feats,
+            duration,
             feat_stride,
             num_frames,
             fps,
             score_thresh=args.score_thresh,
+            id_to_label=id_to_label,
         )
-
-        # Apply NMS
-        if detections:
-            detections = nms_1d_cpu_wrapper(detections, args.nms_thresh)
 
         results[video_id] = {
             "fps": float(fps),
+            "duration": float(duration),
             "detections": detections,
         }
         print(
             f"  [{video_id}] {len(detections)} detections "
-            f"(before NMS: ~{len(detections)})"
+            f"(score_thresh={args.score_thresh})"
         )
 
     # Save results
@@ -380,12 +293,5 @@ if __name__ == "__main__":
         default=0.3,
         help="Confidence threshold for detections",
     )
-    parser.add_argument(
-        "--nms-thresh",
-        type=float,
-        default=0.5,
-        help="IoU threshold for NMS",
-    )
-
     args = parser.parse_args()
     main(args)

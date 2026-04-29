@@ -1,6 +1,6 @@
-"""Dataset for class-agnostic temporal action localization on the 30s/10s
-chunk dataset, plus optional auxiliary categorical labels (body_part /
-action_type / grip_or_contact / speed_or_force / posture_change).
+"""Dataset for temporal action localization on the 30s/10s chunk dataset.
+
+Supports binary and combined multiclass label modes.
 
 Plugs into upstream ActionFormer via its `register_dataset` registry.
 
@@ -8,7 +8,7 @@ Per-sample dict (consumed by the model + loss):
     video_id        : str
     feats           : Tensor (C, T)               C=embed_dim, T=num_steps
     segments        : Tensor (N, 2)               in feature-grid units
-    labels          : LongTensor (N,)             always 0 (single class "action")
+    labels          : LongTensor (N,)             class id per segment
     aux_labels      : dict[str, LongTensor (N,)]  per-segment aux class id
                                                   (0 == OTHER for unknown values)
     fps             : float                       target_fps used at extraction
@@ -60,6 +60,47 @@ AUX_FIELDS_DEFAULT: tuple[str, ...] = (
     "posture_change",
 )
 
+BODY_PART_MERGE_ORDER: tuple[str, ...] = (
+    "両手",
+    "両足",
+    "頭部",
+    "右手",
+    "左手",
+    "右足",
+    "左足",
+)
+BODY_PART_OTHER = "その他"
+
+ACTION_TYPE_MERGE_ORDER: tuple[str, ...] = (
+    "運ぶ",
+    "伸ばす",
+    "つかむ",
+    "位置決め",
+    "離す",
+    "保持",
+    "押す",
+    "回す",
+    "滑らせる",
+    "持ち上げる",
+    "引く",
+    "位置ぎめ",
+    "置く",
+    "押し込む",
+    "移動",
+    "向きを変える",
+    "曲げる",
+    "視線を向ける",
+    "待機",
+    "動かす",
+    "使用",
+    "検査",
+    "組み立て",
+    "切る",
+    "叩く",
+)
+ACTION_TYPE_OTHER = "その他"
+COMBINED_OTHER = f"{BODY_PART_OTHER}|{ACTION_TYPE_OTHER}"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,6 +137,13 @@ def _encode_aux(value: str, label_to_id: dict[str, int]) -> int:
     if value is None:
         return 0  # OTHER
     return label_to_id.get(str(value).strip(), 0)
+
+
+def _merge_by_contains(label: str, ordered_targets: tuple[str, ...], other_label: str) -> str:
+    for target in ordered_targets:
+        if target in label:
+            return target
+    return other_label
 
 
 def _truncate_feats_with_aux(
@@ -160,7 +208,7 @@ def _truncate_feats_with_aux(
 
 @register_dataset("tal_motion")
 class TalMotionDataset(Dataset):
-    """30s/10s chunk dataset for class-agnostic TAL with optional aux heads.
+    """30s/10s chunk dataset for TAL with optional aux heads.
 
     Constructor args follow upstream's `make_dataset` convention. New args
     (relative to THUMOS14Dataset) are at the bottom.
@@ -191,12 +239,11 @@ class TalMotionDataset(Dataset):
         aux_fields: tuple[str, ...] = AUX_FIELDS_DEFAULT,
         skip_no_actions: bool = True,
         tiou_thresholds=(0.3, 0.4, 0.5, 0.6, 0.7),
+        label_mode: str = "binary",
+        combined_vocab_file: str | None = None,
+        merge_combined_labels: bool = True,
     ):
         super().__init__()
-        # class-agnostic: enforce 1 class
-        assert num_classes == 1, (
-            f"TalMotionDataset is class-agnostic; expected num_classes=1, got {num_classes}"
-        )
         if not annot_dir:
             raise ValueError("annot_dir is required for TalMotionDataset")
         if not split_list_dir:
@@ -220,6 +267,8 @@ class TalMotionDataset(Dataset):
         self.split_list_dir = Path(split_list_dir)
         self.aux_fields = tuple(aux_fields)
         self.skip_no_actions = skip_no_actions
+        self.label_mode = str(label_mode)
+        self.merge_combined_labels = bool(merge_combined_labels)
 
         # aux vocab: {field: {label_str: id, "OTHER": 0}}
         self.aux_vocab = _load_aux_vocab(aux_vocab_file) or {}
@@ -227,6 +276,32 @@ class TalMotionDataset(Dataset):
             f: max(self.aux_vocab.get(f, {"OTHER": 0}).values()) + 1
             for f in self.aux_fields
         }
+        self.combined_label_to_id: dict[str, int] = {}
+        if self.label_mode == "binary":
+            if self.num_classes != 1:
+                raise ValueError(
+                    f"label_mode='binary' requires num_classes=1, got {self.num_classes}"
+                )
+        elif self.label_mode == "combined":
+            if not combined_vocab_file:
+                raise ValueError(
+                    "label_mode='combined' requires combined_vocab_file"
+                )
+            payload = json.loads(Path(combined_vocab_file).read_text(encoding="utf-8"))
+            combined = payload.get("combined_label", {})
+            self.combined_label_to_id = combined.get("label_to_id", {})
+            if not self.combined_label_to_id:
+                raise ValueError(
+                    f"Invalid combined vocab file (label_to_id missing): {combined_vocab_file}"
+                )
+            expected_num_classes = max(self.combined_label_to_id.values()) + 1
+            if self.num_classes != expected_num_classes:
+                raise ValueError(
+                    f"num_classes mismatch: config={self.num_classes}, "
+                    f"combined_vocab={expected_num_classes}"
+                )
+        else:
+            raise ValueError(f"Unsupported label_mode={self.label_mode!r}")
 
         # Collect annotation filenames from union of named splits.
         names: list[str] = []
@@ -290,8 +365,41 @@ class TalMotionDataset(Dataset):
                 segments = np.asarray(
                     [[a.start_time, a.end_time] for a in actions], dtype=np.float32
                 )
-                # all class-agnostic -> label 0
-                labels = np.zeros(len(actions), dtype=np.int64)
+                if self.label_mode == "binary":
+                    labels = np.zeros(len(actions), dtype=np.int64)
+                else:
+                    labels_list: list[int] = []
+                    for a in actions:
+                        body_part = str(getattr(a, "body_part", "") or "").strip()
+                        action_type = str(getattr(a, "action_type", "") or "").strip()
+                        if self.merge_combined_labels:
+                            body_part = (
+                                _merge_by_contains(
+                                    body_part, BODY_PART_MERGE_ORDER, BODY_PART_OTHER
+                                )
+                                if body_part
+                                else BODY_PART_OTHER
+                            )
+                            action_type = (
+                                _merge_by_contains(
+                                    action_type, ACTION_TYPE_MERGE_ORDER, ACTION_TYPE_OTHER
+                                )
+                                if action_type
+                                else ACTION_TYPE_OTHER
+                            )
+                        else:
+                            if not body_part:
+                                body_part = BODY_PART_OTHER
+                            if not action_type:
+                                action_type = ACTION_TYPE_OTHER
+                        key = f"{body_part}|{action_type}"
+                        labels_list.append(
+                            self.combined_label_to_id.get(
+                                key,
+                                self.combined_label_to_id.get(COMBINED_OTHER, 0),
+                            )
+                        )
+                    labels = np.asarray(labels_list, dtype=np.int64)
                 aux: dict[str, np.ndarray] = {}
                 for f in self.aux_fields:
                     if f not in self.aux_vocab:

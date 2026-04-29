@@ -47,6 +47,28 @@ from actionformer_libs.utils import (  # noqa: E402
 )
 
 
+def _apply_multiclass_overrides(cfg: dict) -> None:
+    dataset_cfg = cfg.get("dataset", {})
+    if dataset_cfg.get("label_mode", "binary") != "combined":
+        return
+    vocab_file = dataset_cfg.get("combined_vocab_file", "")
+    if not vocab_file:
+        raise ValueError("label_mode=combined requires dataset.combined_vocab_file")
+    p = Path(vocab_file)
+    if not p.exists():
+        raise FileNotFoundError(f"combined_vocab_file not found: {p}")
+    payload = json.loads(p.read_text(encoding="utf-8"))
+    label_to_id = payload.get("combined_label", {}).get("label_to_id", {})
+    if not label_to_id:
+        raise ValueError(f"Invalid combined vocab (combined_label.label_to_id): {p}")
+    num_classes = max(label_to_id.values()) + 1
+    cfg["dataset"]["num_classes"] = num_classes
+    cfg["model"]["num_classes"] = num_classes
+    cfg["test_cfg"]["multiclass_nms"] = True
+    cfg["model"]["test_cfg"]["multiclass_nms"] = True
+    print(f"[Eval] Combined multiclass mode enabled (num_classes={num_classes})")
+
+
 def main(args):
     """Main evaluation function."""
 
@@ -58,6 +80,7 @@ def main(args):
         raise FileNotFoundError(f"Config not found: {args.config}")
 
     cfg = load_config(args.config)
+    _apply_multiclass_overrides(cfg)
     pprint(cfg)
 
     # =========================================================================
