@@ -21,6 +21,7 @@ Environment variables (set before running):
 import argparse
 import datetime
 import json
+import math
 import os
 import sys
 import tempfile
@@ -48,6 +49,7 @@ from actionformer_libs.datasets import make_dataset, make_data_loader  # noqa: E
 from actionformer_libs.modeling import make_meta_arch  # noqa: E402
 from actionformer_libs.utils import (  # noqa: E402
     valid_one_epoch,
+    ANETdetection,
     save_checkpoint,
     make_optimizer,
     make_scheduler,
@@ -175,8 +177,61 @@ def _save_ckpt(ckpt_folder: str, cfg: dict, model: nn.Module, model_ema, optimiz
         )
 
 
+def _run_validation_with_nms_fallback(
+    *,
+    val_loader,
+    model_for_eval,
+    global_step: int,
+    val_evaluator,
+    val_output_file: str,
+    tb_writer,
+    print_freq: int,
+) -> float:
+    """Run validation, falling back to NMS-free mode if extension is missing."""
+    try:
+        return float(
+            valid_one_epoch(
+                val_loader,
+                model_for_eval,
+                global_step,
+                evaluator=val_evaluator,
+                output_file=None if val_evaluator is not None else val_output_file,
+                tb_writer=tb_writer,
+                print_freq=print_freq,
+            )
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        if "nms_1d_cpu extension not built" not in msg:
+            raise
+        print(
+            "[Validation] nms_1d_cpu extension is missing. "
+            "Retrying validation with test_nms_method='none'."
+        )
+        # model_for_eval is DataParallel; underlying model is .module
+        inner = model_for_eval.module
+        orig_method = getattr(inner, "test_nms_method", "none")
+        try:
+            inner.test_nms_method = "none"
+            return float(
+                valid_one_epoch(
+                    val_loader,
+                    model_for_eval,
+                    global_step,
+                    evaluator=val_evaluator,
+                    output_file=None if val_evaluator is not None else val_output_file,
+                    tb_writer=tb_writer,
+                    print_freq=print_freq,
+                )
+            )
+        finally:
+            inner.test_nms_method = orig_method
+
+
 def main(args):
     """Main training function."""
+    if args.grad_accum_steps < 1:
+        raise ValueError("--grad-accum-steps must be >= 1")
 
     # =========================================================================
     # 1. Setup config and output folder
@@ -193,6 +248,8 @@ def main(args):
         cfg["dataset"]["annot_dir"] = args.annot_dir
     if args.split_list_dir:
         cfg["dataset"]["split_list_dir"] = args.split_list_dir
+    if args.batch_size > 0:
+        cfg["loader"]["batch_size"] = args.batch_size
 
     split_list_tmpdir = None
     if args.feature_list_txt:
@@ -292,12 +349,18 @@ def main(args):
         train_dataset, True, rng_generator, **cfg["loader"]
     )
     num_iters_per_epoch = len(train_loader)
-    print(f"[Training] Iters per epoch: {num_iters_per_epoch}")
+    updates_per_epoch = math.ceil(num_iters_per_epoch / args.grad_accum_steps)
+    print(
+        f"[Training] Iters per epoch: {num_iters_per_epoch}, "
+        f"updates per epoch: {updates_per_epoch} "
+        f"(grad_accum_steps={args.grad_accum_steps})"
+    )
     if num_iters_per_epoch <= 0:
         raise RuntimeError("No training iterations available. Check dataset/split/feature files.")
 
     # Optional validation dataset/loader
     val_loader = None
+    val_evaluator = None
     if args.val_every > 0:
         val_cfg = deepcopy(cfg)
         if args.val_feat_dir:
@@ -333,6 +396,23 @@ def main(args):
             batch_size=1,
             num_workers=val_cfg["loader"].get("num_workers", 0),
         )
+        # Prefer true mAP evaluation when ANET evaluator can be constructed.
+        try:
+            val_db_vars = val_dataset.get_attributes()
+            tiou_thresholds = val_db_vars.get(
+                "tiou_thresholds", [0.3, 0.4, 0.5, 0.6, 0.7]
+            )
+            val_evaluator = ANETdetection(
+                val_dataset.json_file if hasattr(val_dataset, "json_file") else None,
+                val_dataset.split[0] if hasattr(val_dataset, "split") else "val",
+                tiou_thresholds=tiou_thresholds,
+            )
+            print(f"[Training] Validation evaluator enabled (tIoU={tiou_thresholds})")
+        except Exception as e:
+            val_evaluator = None
+            print(
+                f"[Training] Validation evaluator unavailable, fallback to prediction dump only: {e}"
+            )
         if val_split_tmpdir is not None:
             # Keep temporary directory alive during training loop.
             _ = val_split_tmpdir
@@ -346,7 +426,7 @@ def main(args):
     model = nn.DataParallel(model, device_ids=args.devices)
 
     optimizer = make_optimizer(model, cfg["opt"])
-    scheduler = make_scheduler(optimizer, cfg["opt"], num_iters_per_epoch)
+    scheduler = make_scheduler(optimizer, cfg["opt"], updates_per_epoch)
 
     # Model EMA
     print("[Training] Enabling Model EMA...")
@@ -365,7 +445,7 @@ def main(args):
                 map_location=lambda storage, loc: storage.cuda(args.devices[0]),
             )
             start_epoch = checkpoint.get("epoch", 0)
-            global_step = checkpoint.get("global_step", start_epoch * num_iters_per_epoch)
+            global_step = checkpoint.get("global_step", start_epoch * updates_per_epoch)
             model.load_state_dict(checkpoint["state_dict"])
             model_ema.module.load_state_dict(checkpoint["state_dict_ema"])
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -393,84 +473,90 @@ def main(args):
         batch_time = _AverageMeter()
         losses_tracker: dict[str, _AverageMeter] = {}
         start_time = time.time()
+        optimizer.zero_grad(set_to_none=True)
 
         for iter_idx, video_list in enumerate(train_loader, 0):
-            optimizer.zero_grad(set_to_none=True)
             losses = model(video_list)
-            losses["final_loss"].backward()
-            if cfg["train_cfg"]["clip_grad_l2norm"] > 0.0:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    cfg["train_cfg"]["clip_grad_l2norm"],
-                )
-            optimizer.step()
-            scheduler.step()
-            if model_ema is not None:
-                model_ema.update(model)
-            global_step += 1
+            (losses["final_loss"] / args.grad_accum_steps).backward()
 
             for key, value in losses.items():
                 if key not in losses_tracker:
                     losses_tracker[key] = _AverageMeter()
                 losses_tracker[key].update(float(value.item()))
 
-            if tb_writer is not None:
-                lr = scheduler.get_last_lr()[0]
-                tb_writer.add_scalar("train/learning_rate", lr, global_step)
-                tb_writer.add_scalar("train/final_loss", losses_tracker["final_loss"].val, global_step)
-            if wandb_run is not None:
-                lr = scheduler.get_last_lr()[0]
-                wandb.log(
-                    {
-                        "train/learning_rate": lr,
-                        "train/final_loss": losses_tracker["final_loss"].val,
-                        "epoch": epoch + 1,
-                        "global_step": global_step,
-                    },
-                    step=global_step,
-                )
+            should_update = ((iter_idx + 1) % args.grad_accum_steps == 0) or (
+                (iter_idx + 1) == num_iters_per_epoch
+            )
+            if should_update:
+                if cfg["train_cfg"]["clip_grad_l2norm"] > 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        cfg["train_cfg"]["clip_grad_l2norm"],
+                    )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                if model_ema is not None:
+                    model_ema.update(model)
+                global_step += 1
 
-            if (iter_idx != 0) and (iter_idx % args.print_freq == 0):
-                torch.cuda.synchronize()
-                batch_time.update((time.time() - start_time) / args.print_freq)
-                start_time = time.time()
-                print(
-                    f"Epoch[{epoch+1:03d}] Iter[{iter_idx:05d}/{num_iters_per_epoch:05d}] "
-                    f"Step[{global_step}] Time {batch_time.val:.2f} ({batch_time.avg:.2f}) "
-                    f"Loss {losses_tracker['final_loss'].val:.4f} ({losses_tracker['final_loss'].avg:.4f})"
-                )
-
-            if args.save_every_steps > 0 and (global_step % args.save_every_steps == 0):
-                _save_ckpt(
-                    ckpt_folder, cfg, model, model_ema, optimizer, scheduler,
-                    epoch, global_step, args.save_model_only
-                )
-
-            if val_loader is not None and args.val_every > 0 and (global_step % args.val_every == 0):
-                print(f"[Validation] Running at step {global_step} ...")
-                val_output_file = os.path.join(ckpt_folder, f"val_pred_step_{global_step:08d}.pkl")
-                val_map = valid_one_epoch(
-                    val_loader,
-                    model_ema.module,
-                    global_step,
-                    evaluator=None,
-                    output_file=val_output_file,
-                    tb_writer=tb_writer,
-                    print_freq=args.print_freq,
-                )
-                print(
-                    f"[Validation] step={global_step} mAP={val_map:.4f} "
-                    f"(predictions saved: {val_output_file})"
-                )
+                if tb_writer is not None:
+                    lr = scheduler.get_last_lr()[0]
+                    tb_writer.add_scalar("train/learning_rate", lr, global_step)
+                    tb_writer.add_scalar("train/final_loss", losses_tracker["final_loss"].val, global_step)
                 if wandb_run is not None:
+                    lr = scheduler.get_last_lr()[0]
                     wandb.log(
                         {
-                            "validation/mAP": float(val_map),
+                            "train/learning_rate": lr,
+                            "train/final_loss": losses_tracker["final_loss"].val,
                             "epoch": epoch + 1,
                             "global_step": global_step,
                         },
                         step=global_step,
                     )
+
+                if (global_step != 0) and (global_step % args.print_freq == 0):
+                    torch.cuda.synchronize()
+                    batch_time.update((time.time() - start_time) / args.print_freq)
+                    start_time = time.time()
+                    print(
+                        f"Epoch[{epoch+1:03d}] Iter[{iter_idx+1:05d}/{num_iters_per_epoch:05d}] "
+                        f"Step[{global_step}] Time {batch_time.val:.2f} ({batch_time.avg:.2f}) "
+                        f"Loss {losses_tracker['final_loss'].val:.4f} ({losses_tracker['final_loss'].avg:.4f})"
+                    )
+
+                if args.save_every_steps > 0 and (global_step % args.save_every_steps == 0):
+                    _save_ckpt(
+                        ckpt_folder, cfg, model, model_ema, optimizer, scheduler,
+                        epoch, global_step, args.save_model_only
+                    )
+
+                if val_loader is not None and args.val_every > 0 and (global_step % args.val_every == 0):
+                    print(f"[Validation] Running at step {global_step} ...")
+                    val_output_file = os.path.join(ckpt_folder, f"val_pred_step_{global_step:08d}.pkl")
+                    val_map = _run_validation_with_nms_fallback(
+                        val_loader=val_loader,
+                        model_for_eval=model_ema.module,
+                        global_step=global_step,
+                        val_evaluator=val_evaluator,
+                        val_output_file=val_output_file,
+                        tb_writer=tb_writer,
+                        print_freq=args.print_freq,
+                    )
+                    print(
+                        f"[Validation] step={global_step} mAP={val_map:.4f} "
+                        f"(predictions saved: {val_output_file if val_evaluator is None else 'via evaluator'})"
+                    )
+                    if wandb_run is not None:
+                        wandb.log(
+                            {
+                                "validation/mAP": float(val_map),
+                                "epoch": epoch + 1,
+                                "global_step": global_step,
+                            },
+                            step=global_step,
+                        )
 
         train_lr = float(scheduler.get_last_lr()[0])
         tb_writer.add_scalar("train/lr_epoch", train_lr, epoch)
@@ -561,6 +647,18 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="Override dataset.feat_folder (useful for subset experiments)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="Override train dataloader batch size (0 = use config)",
+    )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps (1 = no accumulation)",
     )
     parser.add_argument(
         "--annot-dir",
