@@ -22,3 +22,6 @@
 [submodule "repos/ActionFormer"]
 	path = repos/ActionFormer
 	url = https://github.com/happyharrycn/actionformer_release
+[submodule "repos/AVION"]
+	path = repos/AVION
+	url = https://github.com/zhaoyue-zephyrus/AVION.git
