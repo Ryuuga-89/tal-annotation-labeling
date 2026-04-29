@@ -79,7 +79,6 @@ def main():
     print(f"train_files: {len(train_files)}")
     print(f"val_files: {len(val_files)}")
     print(f"test_files: {len(test_files)}")
-
     print(f"train_files: {train_files}")
     print(f"val_files: {val_files}")
     print(f"test_files: {test_files}")

@@ -29,6 +29,8 @@ from pprint import pprint
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
+import wandb
+from wandb_utils import add_wandb_cli_args, init_wandb_run
 
 # Ensure ActionFormer imports work
 _THIS = Path(__file__).resolve()
@@ -81,6 +83,9 @@ def main(args):
 
     cfg = load_config(args.config)
     _apply_multiclass_overrides(cfg)
+    wandb_run, wandb_run_name = init_wandb_run(args, cfg, "eval_cfg")
+    if wandb_run is not None:
+        print(f"[Eval] W&B enabled: {wandb_run_name}")
     pprint(cfg)
 
     # =========================================================================
@@ -239,6 +244,17 @@ def main(args):
     print(f"\n[Eval] Results saved to: {results_json}")
     print("[Eval] Results summary:")
     pprint(results)
+    if wandb_run is not None:
+        log_payload = {"eval/checkpoint": ckpt_file}
+        for k, v in results.items():
+            if isinstance(v, (int, float)):
+                log_payload[f"eval/{k}"] = v
+        wandb.log(log_payload)
+        if args.wandb_log_output and os.path.exists(results_json):
+            artifact = wandb.Artifact(name=f"eval-results-{wandb_run.id}", type="evaluation_output")
+            artifact.add_file(results_json)
+            wandb_run.log_artifact(artifact)
+        wandb_run.finish()
 
     return results
 
@@ -288,6 +304,12 @@ if __name__ == "__main__":
         "--saveonly",
         action="store_true",
         help="Save predictions only, skip evaluation",
+    )
+    add_wandb_cli_args(parser, default_run_type="test", default_run_desc="eval-tal")
+    parser.add_argument(
+        "--wandb-log-output",
+        action="store_true",
+        help="Upload evaluation result JSON as W&B artifact",
     )
 
     args = parser.parse_args()

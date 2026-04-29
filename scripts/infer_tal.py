@@ -23,6 +23,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import wandb
+from wandb_utils import add_wandb_cli_args, init_wandb_run
 
 # Ensure ActionFormer imports work
 _THIS = Path(__file__).resolve()
@@ -217,6 +219,9 @@ def main(args):
         raise FileNotFoundError(f"Config not found: {args.config}")
     cfg = load_config(args.config)
     id_to_label = _load_combined_id_to_label(cfg)
+    wandb_run, wandb_run_name = init_wandb_run(args, cfg, "infer_cfg")
+    if wandb_run is not None:
+        print(f"[Inference] W&B enabled: {wandb_run_name}")
     print(f"[Inference] Loaded config: {cfg['dataset_name']}")
     if not args.feature_list_txt and not args.feat_dir:
         raise ValueError("Either --feat-dir or --feature-list-txt must be provided")
@@ -300,6 +305,19 @@ def main(args):
     print(f"[Inference] Total videos: {len(results)}")
     total_dets = sum(len(r["detections"]) for r in results.values())
     print(f"[Inference] Total detections: {total_dets}")
+    if wandb_run is not None:
+        wandb.log(
+            {
+                "inference/total_videos": len(results),
+                "inference/total_detections": total_dets,
+                "inference/avg_detections_per_video": (total_dets / max(1, len(results))),
+            }
+        )
+        if args.wandb_log_output and os.path.exists(output_json):
+            artifact = wandb.Artifact(name=f"infer-output-{wandb_run.id}", type="inference_output")
+            artifact.add_file(output_json)
+            wandb_run.log_artifact(artifact)
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
@@ -354,6 +372,12 @@ if __name__ == "__main__":
         type=float,
         default=0.3,
         help="Confidence threshold for detections",
+    )
+    add_wandb_cli_args(parser, default_run_type="test", default_run_desc="infer-tal")
+    parser.add_argument(
+        "--wandb-log-output",
+        action="store_true",
+        help="Upload output JSON as W&B artifact",
     )
     args = parser.parse_args()
     main(args)

@@ -25,6 +25,7 @@ import os
 import sys
 import tempfile
 import time
+from copy import deepcopy
 from pathlib import Path
 from pprint import pprint
 
@@ -32,6 +33,8 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
+import wandb
+from wandb_utils import add_wandb_cli_args, init_wandb_run
 
 # Ensure ActionFormer imports work
 _THIS = Path(__file__).resolve()
@@ -44,13 +47,29 @@ from actionformer_libs.core.config import load_config  # noqa: E402
 from actionformer_libs.datasets import make_dataset, make_data_loader  # noqa: E402
 from actionformer_libs.modeling import make_meta_arch  # noqa: E402
 from actionformer_libs.utils import (  # noqa: E402
-    train_one_epoch,
+    valid_one_epoch,
     save_checkpoint,
     make_optimizer,
     make_scheduler,
     fix_random_seed,
     ModelEma,
 )
+
+class _AverageMeter:
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.val = 0.0
+        self.avg = 0.0
+        self.sum = 0.0
+        self.count = 0
+
+    def update(self, val: float, n: int = 1) -> None:
+        self.val = float(val)
+        self.sum += float(val) * n
+        self.count += n
+        self.avg = self.sum / max(self.count, 1)
 
 
 def _apply_multiclass_overrides(cfg: dict) -> None:
@@ -120,6 +139,42 @@ def _load_stems_from_path_list(path_list_txt: str) -> list[str]:
     return out
 
 
+def _build_split_list_tmpdir(stems: list[str], split_name: str) -> tempfile.TemporaryDirectory:
+    tmpdir = tempfile.TemporaryDirectory(prefix=f"tal_{split_name}_from_featlist_")
+    split_file = Path(tmpdir.name) / f"{split_name}.txt"
+    split_file.write_text("\n".join(f"{stem}.json" for stem in stems) + "\n", encoding="utf-8")
+    return tmpdir
+
+
+def _save_ckpt(ckpt_folder: str, cfg: dict, model: nn.Module, model_ema, optimizer, scheduler, epoch: int, global_step: int, save_model_only: bool) -> None:
+    ckpt_state = {
+        "epoch": epoch + 1,
+        "global_step": global_step,
+        "model_name": cfg["model_name"],
+        "state_dict": model.state_dict(),
+        "state_dict_ema": model_ema.module.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+    }
+    save_checkpoint(
+        ckpt_state,
+        False,
+        file_folder=ckpt_folder,
+        file_name=f"step_{global_step:08d}.pth.tar",
+    )
+    if save_model_only:
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "global_step": global_step,
+                "model_name": cfg["model_name"],
+                "state_dict": ckpt_state["state_dict"],
+                "state_dict_ema": ckpt_state["state_dict_ema"],
+            },
+            os.path.join(ckpt_folder, f"step_{global_step:08d}.model_only.pth"),
+        )
+
+
 def main(args):
     """Main training function."""
 
@@ -144,12 +199,7 @@ def main(args):
         stems = _load_stems_from_path_list(args.feature_list_txt)
         if not stems:
             raise ValueError(f"No valid entries in feature list: {args.feature_list_txt}")
-        split_list_tmpdir = tempfile.TemporaryDirectory(prefix="tal_split_from_featlist_")
-        split_train = Path(split_list_tmpdir.name) / "train.txt"
-        split_train.write_text(
-            "\n".join(f"{stem}.json" for stem in stems) + "\n",
-            encoding="utf-8",
-        )
+        split_list_tmpdir = _build_split_list_tmpdir(stems, "train")
         cfg["train_split"] = ["train"]
         cfg["dataset"]["split_list_dir"] = split_list_tmpdir.name
         print(
@@ -202,6 +252,10 @@ def main(args):
     with open(config_save_path, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False)
     print(f"[Training] Config saved to: {config_save_path}")
+    wandb_run, wandb_run_name = init_wandb_run(args, cfg, "train_cfg")
+    if wandb_run is not None:
+        wandb_run.config.update({"checkpoint_folder": ckpt_folder}, allow_val_change=True)
+        print(f"[Training] W&B enabled: {wandb_run_name}")
 
     # TensorBoard writer
     tb_writer = SummaryWriter(os.path.join(ckpt_folder, "logs"))
@@ -242,6 +296,47 @@ def main(args):
     if num_iters_per_epoch <= 0:
         raise RuntimeError("No training iterations available. Check dataset/split/feature files.")
 
+    # Optional validation dataset/loader
+    val_loader = None
+    if args.val_every > 0:
+        val_cfg = deepcopy(cfg)
+        if args.val_feat_dir:
+            val_cfg["dataset"]["feat_folder"] = args.val_feat_dir
+        if args.val_annot_dir:
+            val_cfg["dataset"]["annot_dir"] = args.val_annot_dir
+        if args.val_split_list_dir:
+            val_cfg["dataset"]["split_list_dir"] = args.val_split_list_dir
+        val_split = [args.val_split] if args.val_split else list(val_cfg.get("val_split", ["val"]))
+
+        val_split_tmpdir = None
+        if args.val_feature_list_txt:
+            val_stems = _load_stems_from_path_list(args.val_feature_list_txt)
+            if not val_stems:
+                raise ValueError(f"No valid entries in val feature list: {args.val_feature_list_txt}")
+            val_split_tmpdir = _build_split_list_tmpdir(val_stems, "val")
+            val_split = ["val"]
+            val_cfg["dataset"]["split_list_dir"] = val_split_tmpdir.name
+            print(
+                f"[Training] Using val feature-list based subset: {len(val_stems)} items "
+                f"(split_list_dir={val_split_tmpdir.name})"
+            )
+
+        print(f"[Training] Creating validation dataset (every {args.val_every} epoch[s])...")
+        val_dataset = make_dataset(
+            val_cfg["dataset_name"], False, val_split, **val_cfg["dataset"]
+        )
+        print(f"[Training] Val samples: {len(val_dataset)}")
+        val_loader = make_data_loader(
+            val_dataset,
+            False,
+            None,
+            batch_size=1,
+            num_workers=val_cfg["loader"].get("num_workers", 0),
+        )
+        if val_split_tmpdir is not None:
+            # Keep temporary directory alive during training loop.
+            _ = val_split_tmpdir
+
     # =========================================================================
     # 3. Create model, optimizer, scheduler
     # =========================================================================
@@ -261,6 +356,7 @@ def main(args):
     # 4. Resume from checkpoint (optional)
     # =========================================================================
     start_epoch = 0
+    global_step = 0
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"[Training] Resuming from: {args.resume}")
@@ -269,11 +365,12 @@ def main(args):
                 map_location=lambda storage, loc: storage.cuda(args.devices[0]),
             )
             start_epoch = checkpoint.get("epoch", 0)
+            global_step = checkpoint.get("global_step", start_epoch * num_iters_per_epoch)
             model.load_state_dict(checkpoint["state_dict"])
             model_ema.module.load_state_dict(checkpoint["state_dict_ema"])
             optimizer.load_state_dict(checkpoint["optimizer"])
             scheduler.load_state_dict(checkpoint["scheduler"])
-            print(f"[Training] Resumed from epoch {start_epoch}")
+            print(f"[Training] Resumed from epoch {start_epoch}, step {global_step}")
         else:
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
 
@@ -292,48 +389,124 @@ def main(args):
 
     for epoch in range(start_epoch, max_epochs):
         print(f"\n[Epoch {epoch+1}/{max_epochs}]")
+        model.train()
+        batch_time = _AverageMeter()
+        losses_tracker: dict[str, _AverageMeter] = {}
+        start_time = time.time()
 
-        # Train one epoch (upstream API returns None)
-        train_one_epoch(
-            train_loader,
-            model,
-            optimizer,
-            scheduler,
-            epoch,
-            model_ema=model_ema,
-            clip_grad_l2norm=cfg["train_cfg"]["clip_grad_l2norm"],
-            tb_writer=tb_writer,
-            print_freq=args.print_freq,
-        )
+        for iter_idx, video_list in enumerate(train_loader, 0):
+            optimizer.zero_grad(set_to_none=True)
+            losses = model(video_list)
+            losses["final_loss"].backward()
+            if cfg["train_cfg"]["clip_grad_l2norm"] > 0.0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    cfg["train_cfg"]["clip_grad_l2norm"],
+                )
+            optimizer.step()
+            scheduler.step()
+            if model_ema is not None:
+                model_ema.update(model)
+            global_step += 1
 
-        # epoch-level LR logging
+            for key, value in losses.items():
+                if key not in losses_tracker:
+                    losses_tracker[key] = _AverageMeter()
+                losses_tracker[key].update(float(value.item()))
+
+            if tb_writer is not None:
+                lr = scheduler.get_last_lr()[0]
+                tb_writer.add_scalar("train/learning_rate", lr, global_step)
+                tb_writer.add_scalar("train/final_loss", losses_tracker["final_loss"].val, global_step)
+            if wandb_run is not None:
+                lr = scheduler.get_last_lr()[0]
+                wandb.log(
+                    {
+                        "train/learning_rate": lr,
+                        "train/final_loss": losses_tracker["final_loss"].val,
+                        "epoch": epoch + 1,
+                        "global_step": global_step,
+                    },
+                    step=global_step,
+                )
+
+            if (iter_idx != 0) and (iter_idx % args.print_freq == 0):
+                torch.cuda.synchronize()
+                batch_time.update((time.time() - start_time) / args.print_freq)
+                start_time = time.time()
+                print(
+                    f"Epoch[{epoch+1:03d}] Iter[{iter_idx:05d}/{num_iters_per_epoch:05d}] "
+                    f"Step[{global_step}] Time {batch_time.val:.2f} ({batch_time.avg:.2f}) "
+                    f"Loss {losses_tracker['final_loss'].val:.4f} ({losses_tracker['final_loss'].avg:.4f})"
+                )
+
+            if args.save_every_steps > 0 and (global_step % args.save_every_steps == 0):
+                _save_ckpt(
+                    ckpt_folder, cfg, model, model_ema, optimizer, scheduler,
+                    epoch, global_step, args.save_model_only
+                )
+
+            if val_loader is not None and args.val_every > 0 and (global_step % args.val_every == 0):
+                print(f"[Validation] Running at step {global_step} ...")
+                val_output_file = os.path.join(ckpt_folder, f"val_pred_step_{global_step:08d}.pkl")
+                val_map = valid_one_epoch(
+                    val_loader,
+                    model_ema.module,
+                    global_step,
+                    evaluator=None,
+                    output_file=val_output_file,
+                    tb_writer=tb_writer,
+                    print_freq=args.print_freq,
+                )
+                print(
+                    f"[Validation] step={global_step} mAP={val_map:.4f} "
+                    f"(predictions saved: {val_output_file})"
+                )
+                if wandb_run is not None:
+                    wandb.log(
+                        {
+                            "validation/mAP": float(val_map),
+                            "epoch": epoch + 1,
+                            "global_step": global_step,
+                        },
+                        step=global_step,
+                    )
+
         train_lr = float(scheduler.get_last_lr()[0])
         tb_writer.add_scalar("train/lr_epoch", train_lr, epoch)
         tb_writer.flush()
+        print(f"[Epoch {epoch+1}] lr={train_lr:.2e}, global_step={global_step}")
 
-        print(f"[Epoch {epoch+1}] lr={train_lr:.2e}")
-
-        should_save = (
-            (epoch + 1) == max_epochs
-            or (args.ckpt_freq > 0 and ((epoch + 1) % args.ckpt_freq == 0))
-        )
-        if should_save:
-            save_checkpoint(
-                {
-                    "epoch": epoch + 1,
-                    "model_name": cfg["model_name"],
-                    "state_dict": model.state_dict(),
-                    "state_dict_ema": model_ema.module.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                },
-                False,
-                file_folder=ckpt_folder,
-                file_name=f"epoch_{epoch+1:03d}.pth.tar",
+        if args.save_every_steps <= 0:
+            should_save_epoch = (
+                (epoch + 1) == max_epochs
+                or (args.ckpt_freq > 0 and ((epoch + 1) % args.ckpt_freq == 0))
             )
+            if should_save_epoch:
+                _save_ckpt(
+                    ckpt_folder, cfg, model, model_ema, optimizer, scheduler,
+                    epoch, global_step, args.save_model_only
+                )
+
+        if wandb_run is not None and args.wandb_log_ckpt and (
+            args.save_every_steps > 0 or should_save_epoch
+        ):
+            ckpt_path = os.path.join(ckpt_folder, f"step_{global_step:08d}.pth.tar")
+            if os.path.exists(ckpt_path):
+                artifact = wandb.Artifact(
+                    name=f"checkpoint-step-{global_step:08d}",
+                    type="model",
+                    metadata={"epoch": epoch + 1, "global_step": global_step},
+                )
+                artifact.add_file(ckpt_path)
+                wandb_run.log_artifact(artifact)
 
     print(f"\n[Training] Finished training. Results in: {ckpt_folder}")
     tb_writer.close()
+    if wandb_run is not None:
+        wandb_run.summary["final_global_step"] = global_step
+        wandb_run.summary["final_epoch"] = max_epochs
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
@@ -414,10 +587,66 @@ if __name__ == "__main__":
         help="Checkpoint frequency in epochs (<=0 disables periodic saves)",
     )
     parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=0,
+        help=(
+            "Save checkpoint every N optimizer steps (gradient updates). "
+            "If >0, this takes priority over --ckpt-freq."
+        ),
+    )
+    parser.add_argument(
+        "--save-model-only",
+        action="store_true",
+        help="Additionally save a model-only checkpoint (no optimizer/scheduler states)",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=32,
         help="Upper bound for dataloader num_workers after GPU scaling",
+    )
+    parser.add_argument(
+        "--val-every",
+        type=int,
+        default=0,
+        help="Run validation every N optimizer steps (gradient updates); 0 disables validation",
+    )
+    parser.add_argument(
+        "--val-split",
+        type=str,
+        default="",
+        help="Validation split name (default: use config val_split)",
+    )
+    parser.add_argument(
+        "--val-feat-dir",
+        type=str,
+        default="",
+        help="Override validation dataset.feat_folder",
+    )
+    parser.add_argument(
+        "--val-annot-dir",
+        type=str,
+        default="",
+        help="Override validation dataset.annot_dir",
+    )
+    parser.add_argument(
+        "--val-split-list-dir",
+        type=str,
+        default="",
+        help="Override validation dataset.split_list_dir",
+    )
+    parser.add_argument(
+        "--val-feature-list-txt",
+        type=str,
+        default="",
+        help="Validation subset txt (one .json/.npy path per line)",
+    )
+    add_wandb_cli_args(parser, default_run_type="train", default_run_desc="tal-motion")
+    parser.add_argument(
+        "--wandb-log-ckpt",
+        action="store_true",
+        help="Upload saved checkpoints as W&B artifacts",
     )
 
     args = parser.parse_args()
