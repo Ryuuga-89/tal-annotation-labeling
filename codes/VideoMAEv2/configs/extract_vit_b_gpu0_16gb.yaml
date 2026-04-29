@@ -1,0 +1,30 @@
+model_name: vit_base_patch16_224
+ckpt_path: models/vit_b/vit_b_k710_dl_from_giant.pth
+
+# Input data paths (new environment)
+annot_dir: /82e9e7ee-18e9-4474-b87c-64a92999d1c1/qwen-finetuning-data/ft-fact-videos/annot
+video_dir: /82e9e7ee-18e9-4474-b87c-64a92999d1c1/qwen-finetuning-data/ft-fact-videos/30s_chunks
+
+# Save to a directory separated from previous extraction runs
+out_dir: data/features/30s_mae_b_16gb_gpu0
+video_suffix: .mp4
+
+target_fps: 10.0
+window_size: 16
+stride: 2
+input_size: 224
+resize_mode: squash
+
+# Keep GPU memory usage low and stable (target: <= ~16GB)
+device: cuda
+gpu_id: 0
+dtype: float16
+save_dtype: float16
+batch_size: 8
+num_workers: 0
+decode_mode: batch
+max_batch_size_batch_decode: 8
+auto_batch_size: false
+
+overwrite: false
+fail_on_missing_video: false

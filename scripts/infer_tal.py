@@ -110,6 +110,8 @@ def load_model(cfg: dict, ckpt_path: str, device_index: int, use_cuda: bool) -> 
     """Load ActionFormer model from config and checkpoint."""
     model = make_meta_arch(cfg["model_name"], **cfg["model"])
     if use_cuda:
+        torch.cuda.set_device(device_index)
+        model = model.cuda(device_index)
         model = nn.DataParallel(model, device_ids=[device_index])
 
     if not os.path.isfile(ckpt_path):
@@ -219,7 +221,11 @@ def main(args):
     if not args.feature_list_txt and not args.feat_dir:
         raise ValueError("Either --feat-dir or --feature-list-txt must be provided")
 
-    _ = fix_random_seed(0, include_cuda=torch.cuda.is_available())
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.device)
+    _ = fix_random_seed(0, include_cuda=False)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(0)
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     print(f"[Inference] Using device: {device}")
 

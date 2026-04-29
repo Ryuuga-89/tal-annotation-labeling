@@ -120,7 +120,11 @@ def main(args):
     # =========================================================================
     # 3. Fix randomness
     # =========================================================================
-    _ = fix_random_seed(0, include_cuda=True)
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for evaluation.")
+    torch.cuda.set_device(args.devices[0])
+    _ = fix_random_seed(0, include_cuda=False)
+    torch.cuda.manual_seed(0)
 
     # =========================================================================
     # 4. Create dataset and dataloader
@@ -145,6 +149,7 @@ def main(args):
     # =========================================================================
     print("[Eval] Creating model...")
     model = make_meta_arch(cfg["model_name"], **cfg["model"])
+    model = model.cuda(args.devices[0])
     model = nn.DataParallel(model, device_ids=args.devices)
 
     print(f"[Eval] Loading checkpoint: {ckpt_file}")

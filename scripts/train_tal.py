@@ -169,6 +169,9 @@ def main(args):
         raise ValueError(
             f"Invalid device ids {bad_devices}; visible cuda devices: 0..{n_visible-1}"
         )
+    primary_device = args.devices[0]
+    torch.cuda.set_device(primary_device)
+    print(f"[Training] Primary CUDA device: {primary_device}")
     cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -204,7 +207,9 @@ def main(args):
     tb_writer = SummaryWriter(os.path.join(ckpt_folder, "logs"))
 
     # Fix random seeds
-    rng_generator = fix_random_seed(cfg.get("init_rand_seed", 0), include_cuda=True)
+    # Avoid touching all GPUs (manual_seed_all) to prevent unintended GPU0 usage.
+    rng_generator = fix_random_seed(cfg.get("init_rand_seed", 0), include_cuda=False)
+    torch.cuda.manual_seed(cfg.get("init_rand_seed", 0))
 
     # Scale LR and workers based on number of GPUs
     num_gpus = len(args.devices)
@@ -242,6 +247,7 @@ def main(args):
     # =========================================================================
     print("[Training] Creating model...")
     model = make_meta_arch(cfg["model_name"], **cfg["model"])
+    model = model.cuda(primary_device)
     model = nn.DataParallel(model, device_ids=args.devices)
 
     optimizer = make_optimizer(model, cfg["opt"])
