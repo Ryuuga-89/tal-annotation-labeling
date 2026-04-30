@@ -1,0 +1,107 @@
+# Class-agnostic TAL on the 30s/10s chunk dataset, using VideoMAE V2 ViT-B
+# features (embed_dim=768, target_fps=10, window=16, stride=2).
+#
+# Sequence length budget:
+#   30s @ 10fps, window=16, stride=2 -> num_steps = 143
+#   10s @ 10fps                       -> num_steps = 43
+# With n_mha_win_size=9 and backbone_arch[-1]=4, ActionFormer requires
+# max_seq_len to be divisible by 128. Use 256 to satisfy this constraint.
+
+dataset_name: tal_motion
+train_split: ['train']
+val_split:   ['val']
+
+dataset: {
+  json_file: "",                     # unused for tal_motion
+  feat_folder: data/features/25k,
+  file_prefix: ~,
+  file_ext: .npy,
+  num_classes: 164,                  # combined_label classes from vocab (incl. OTHER)
+  input_dim: 768,
+  feat_stride: 2,                    # frames per feat step (= extractor stride)
+  num_frames: 16,                    # frames per feat clip (= window)
+  default_fps: 10.0,                 # target_fps used at extraction
+  downsample_rate: 1,
+  max_seq_len: 256,
+  trunc_thresh: 0.5,
+  crop_ratio: [0.9, 1.0],
+  force_upsampling: False,
+  # ---- tal_motion-specific ----
+  annot_dir: /raid/containers/enroot/data/b100/ft_fact_videos/annot/30s_chunks_action_31detail_2,
+  split_list_dir: data/splits/v1,
+  aux_vocab_file: data/aux_stats/v1/aux_vocab.json,
+  label_mode: combined,              # binary | combined
+  combined_vocab_file: data/aux_stats/v1/combined_vocab_merged.json,
+  merge_combined_labels: True,
+  aux_fields: ['body_part', 'action_type', 'grip_or_contact', 'speed_or_force', 'posture_change'],
+  skip_no_actions: True,
+  tiou_thresholds: [0.3, 0.4, 0.5, 0.6, 0.7],
+}
+
+model: {
+  backbone_type: convTransformer,
+  fpn_type: identity,
+  # Smaller pyramid than THUMOS — sequences are ~143, not 2304.
+  backbone_arch: [2, 2, 4],
+  scale_factor: 2,
+  # regression range scaled to step units (1 step = 0.2 sec).
+  # short actions (~0.3s = 1-2 steps) live at level 0; long ones (~10s = 50 steps) at the top.
+  regression_range: [[0, 2], [2, 4], [4, 8], [8, 16], [16, 10000]],
+  n_head: 4,
+  n_mha_win_size: 9,
+  embd_kernel_size: 3,
+  embd_dim: 384,
+  embd_with_ln: True,
+  fpn_dim: 384,
+  fpn_with_ln: True,
+  fpn_start_level: 0,
+  head_dim: 384,
+  head_kernel_size: 3,
+  head_num_layers: 3,
+  head_with_ln: True,
+  max_buffer_len_factor: 6.0,
+  use_abs_pe: False,
+  use_rel_pe: True,
+}
+
+opt: {
+  type: AdamW,
+  learning_rate: 0.0001,
+  weight_decay: 0.05,
+  epochs: 30,
+  warmup: True,
+  warmup_epochs: 3,
+  schedule_type: cosine,
+}
+
+loader: {
+  batch_size: 8,
+  num_workers: 4,
+}
+
+train_cfg: {
+  init_loss_norm: 100,
+  clip_grad_l2norm: 1.0,
+  cls_prior_prob: 0.01,
+  center_sample: radius,
+  center_sample_radius: 1.5,
+  dropout: 0.0,
+  droppath: 0.1,
+  label_smoothing: 0.0,
+  head_empty_cls: [],
+}
+
+test_cfg: {
+  pre_nms_thresh: 0.001,
+  pre_nms_topk: 2000,
+  iou_threshold: 0.1,
+  min_score: 0.001,
+  max_seg_num: 200,
+  nms_method: soft,
+  nms_sigma: 0.5,
+  duration_thresh: 0.05,
+  multiclass_nms: True,
+  voting_thresh: 0.7,
+}
+
+output_folder: ./ckpt/25k/

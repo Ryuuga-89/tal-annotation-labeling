@@ -9,6 +9,7 @@ Importing this module is a no-op past the first time; idempotent.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 
 import sys
 from pathlib import Path
@@ -38,18 +39,44 @@ if "actionformer_libs" not in sys.modules:
     # libs/utils && python setup.py build_ext --inplace`) before training /
     # NMS-using inference. We stub it so that *importing* the package (e.g.
     # for dataset registration) does not require the build.
-    if "nms_1d_cpu" not in sys.modules:
+    _UTILS_DIR = _REPO_ROOT / "libs" / "utils"
+    if str(_UTILS_DIR) not in sys.path:
+        sys.path.insert(0, str(_UTILS_DIR))
+
+    def _try_load_nms_extension() -> bool:
+        # First try regular import path.
         try:
-            importlib.import_module("nms_1d_cpu")
+            mod = importlib.import_module("nms_1d_cpu")
+            # If a real extension is already loaded, keep it.
+            if hasattr(mod, "__file__"):
+                return True
         except ModuleNotFoundError:
+            pass
+        # Then try explicit .so path under libs/utils.
+        for so_path in sorted(_UTILS_DIR.glob("nms_1d_cpu*.so")):
+            spec = importlib.util.spec_from_file_location("nms_1d_cpu", so_path)
+            if spec is None or spec.loader is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.modules["nms_1d_cpu"] = mod
+            return True
+        return False
+
+    if ("nms_1d_cpu" not in sys.modules) or not hasattr(sys.modules["nms_1d_cpu"], "__file__"):
+        loaded = _try_load_nms_extension()
+        if not loaded:
             import types
             stub = types.ModuleType("nms_1d_cpu")
+            stub._is_stub = True  # type: ignore[attr-defined]
+
             def _missing(*_a, **_kw):
                 raise RuntimeError(
                     "nms_1d_cpu extension not built. Run: "
                     "cd repos/ActionFormer/libs/utils && "
                     "python setup.py build_ext --inplace"
                 )
+
             stub.nms = _missing  # type: ignore[attr-defined]
             stub.softnms = _missing  # type: ignore[attr-defined]
             sys.modules["nms_1d_cpu"] = stub

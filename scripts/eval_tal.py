@@ -145,7 +145,7 @@ def main(args):
         val_dataset,
         False,
         None,
-        batch_size=1,
+        batch_size=args.eval_batch_size,
         num_workers=cfg["loader"].get("num_workers", 0),
     )
 
@@ -196,6 +196,7 @@ def main(args):
                 val_dataset.json_file if hasattr(val_dataset, "json_file") else None,
                 val_dataset.split[0] if hasattr(val_dataset, "split") else "val",
                 tiou_thresholds=tiou_thresholds,
+                num_workers=args.eval_workers,
             )
         except Exception as e:
             print(f"[Eval] Warning: Could not create ANETdetection evaluator: {e}")
@@ -310,6 +311,18 @@ if __name__ == "__main__":
         "--wandb-log-output",
         action="store_true",
         help="Upload evaluation result JSON as W&B artifact",
+    )
+    parser.add_argument(
+        "--eval-workers",
+        type=int,
+        default=1,
+        help="ANET evaluator worker processes (default: 1 for stability)",
+    )
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=1,
+        help="Evaluation dataloader batch size",
     )
 
     args = parser.parse_args()
