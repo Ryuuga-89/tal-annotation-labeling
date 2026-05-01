@@ -29,9 +29,9 @@ dataset: {
   # ---- tal_motion-specific ----
   annot_dir: /raid/containers/enroot/data/b100/ft_fact_videos/annot/30s_chunks_action_31detail_2,
   split_list_dir: data/splits/25k,
-  aux_vocab_file: data/aux_stats/25k/aux_vocab.json,
+  aux_vocab_file: data/aux_stats/v1/aux_vocab.json,
   label_mode: combined,              # binary | combined
-  combined_vocab_file: data/aux_stats/25k/combined_vocab_merged.json,
+  combined_vocab_file: data/aux_stats/v1/combined_vocab_merged.json,
   merge_combined_labels: True,
   aux_fields: ['body_part', 'action_type', 'grip_or_contact', 'speed_or_force', 'posture_change'],
   skip_no_actions: True,
@@ -76,7 +76,7 @@ opt: {
 
 loader: {
   batch_size: 8,
-  num_workers: 4,
+  num_workers: 1,
 }
 
 train_cfg: {
@@ -85,7 +85,7 @@ train_cfg: {
   cls_prior_prob: 0.01,
   center_sample: radius,
   center_sample_radius: 1.5,
-  dropout: 0.0,
+  dropout: 0.1,
   droppath: 0.1,
   label_smoothing: 0.0,
   head_empty_cls: [],

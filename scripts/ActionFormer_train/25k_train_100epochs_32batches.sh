@@ -4,19 +4,19 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-DEVICES="${DEVICES:-1 3}"
+DEVICES="${DEVICES:-0 2}"
 read -r -a DEVICE_ARR <<< "$DEVICES"
 
 ARGS=(
   --config codes/ActionFormer/configs/25k.yaml
-  --output-folder outputs/ActionFormer_train/25k_10epochs_16batches
+  --output-folder outputs/ActionFormer_train/25k_100epochs_32batches
   --devices "${DEVICE_ARR[@]}"
-  --tag 25k_10epochs_16batches
+  --tag 25k_100epochs_32batches
   --unit epoch
-  --max-epochs 10
+  --max-epochs 100
   --save-every 5
   --val-every 1
-  --batch-size 16
+  --batch-size 32
   --print-freq 10
   --val-batch-size 1
   --split-list-dir /lustre/work/mt/okamura/tal-annotation-labeling/data/splits/25k
