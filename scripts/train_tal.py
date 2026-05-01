@@ -32,7 +32,11 @@ from pprint import pprint
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import wandb
 from wandb_utils import add_wandb_cli_args, init_wandb_run
 
@@ -44,7 +48,11 @@ if str(_PKG_PARENT) not in sys.path:
 
 from ActionFormer import _upstream  # noqa: F401 -- mount actionformer_libs
 from actionformer_libs.core.config import load_config  # noqa: E402
-from actionformer_libs.datasets import make_dataset, make_data_loader  # noqa: E402
+from actionformer_libs.datasets import make_dataset  # noqa: E402
+from actionformer_libs.datasets.data_utils import (  # noqa: E402
+    trivial_batch_collator,
+    worker_init_reset_seed,
+)
 from actionformer_libs.modeling import make_meta_arch  # noqa: E402
 from actionformer_libs.utils import (  # noqa: E402
     valid_one_epoch,
@@ -71,6 +79,43 @@ class _AverageMeter:
         self.sum += float(val) * n
         self.count += n
         self.avg = self.sum / max(self.count, 1)
+
+
+def _is_distributed() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _is_main_process() -> bool:
+    return (not _is_distributed()) or dist.get_rank() == 0
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    if isinstance(model, (nn.DataParallel, DDP)):
+        return model.module
+    return model
+
+
+def _build_data_loader(
+    dataset,
+    *,
+    is_training: bool,
+    generator,
+    batch_size: int,
+    num_workers: int,
+    sampler=None,
+):
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=trivial_batch_collator,
+        worker_init_fn=(worker_init_reset_seed if is_training else None),
+        shuffle=(is_training and sampler is None),
+        drop_last=is_training,
+        generator=generator,
+        sampler=sampler,
+        persistent_workers=(num_workers > 0),
+    )
 
 
 def _apply_multiclass_overrides(cfg: dict) -> None:
@@ -237,11 +282,27 @@ def main(args):
     """Main training function."""
     if args.grad_accum_steps < 1:
         raise ValueError("--grad-accum-steps must be >= 1")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
+
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+    ddp_enabled = world_size_env > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", "0"))
+    if ddp_enabled and not dist.is_initialized():
+        # ddp-timeout-hours=0 means effectively disable timeout.
+        dist_timeout = (
+            datetime.timedelta(days=3650)
+            if args.ddp_timeout_hours <= 0
+            else datetime.timedelta(hours=args.ddp_timeout_hours)
+        )
+        dist.init_process_group(backend="nccl", timeout=dist_timeout)
 
     # =========================================================================
     # 1. Setup config and output folder
     # =========================================================================
-    print("[Training] Loading config from:", args.config)
+    if _is_main_process():
+        print("[Training] Loading config from:", args.config)
     if not os.path.isfile(args.config):
         raise FileNotFoundError(f"Config not found: {args.config}")
 
@@ -252,26 +313,34 @@ def main(args):
     cfg["loader"]["batch_size"] = args.batch_size
 
     _apply_multiclass_overrides(cfg)
-    pprint(cfg)
+    if _is_main_process():
+        pprint(cfg)
     _validate_max_seq_len_for_model(cfg)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for training, but no GPU is visible.")
     n_visible = torch.cuda.device_count()
-    bad_devices = [d for d in args.devices if d < 0 or d >= n_visible]
-    if bad_devices:
-        raise ValueError(
-            f"Invalid device ids {bad_devices}; visible cuda devices: 0..{n_visible-1}"
-        )
-    primary_device = args.devices[0]
+    if ddp_enabled:
+        if local_rank < 0 or local_rank >= n_visible:
+            raise ValueError(
+                f"Invalid LOCAL_RANK={local_rank}; visible cuda devices: 0..{n_visible-1}"
+            )
+    else:
+        bad_devices = [d for d in args.devices if d < 0 or d >= n_visible]
+        if bad_devices:
+            raise ValueError(
+                f"Invalid device ids {bad_devices}; visible cuda devices: 0..{n_visible-1}"
+            )
+    primary_device = local_rank if ddp_enabled else args.devices[0]
     torch.cuda.set_device(primary_device)
-    print(f"[Training] Primary CUDA device: {primary_device}")
+    if _is_main_process():
+        print(f"[Training] Primary CUDA device: {primary_device}")
     cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
     # Create output folder
-    if not os.path.exists(args.output_folder):
+    if _is_main_process() and not os.path.exists(args.output_folder):
         os.makedirs(args.output_folder)
 
     cfg_filename = os.path.basename(args.config).replace(".yaml", "")
@@ -285,24 +354,30 @@ def main(args):
             args.output_folder, f"{cfg_filename}_{args.tag}"
         )
 
-    if not os.path.exists(ckpt_folder):
+    if _is_main_process() and not os.path.exists(ckpt_folder):
         os.makedirs(ckpt_folder)
 
-    print(f"[Training] Checkpoint folder: {ckpt_folder}")
+    if ddp_enabled:
+        dist.barrier()
+    if _is_main_process():
+        print(f"[Training] Checkpoint folder: {ckpt_folder}")
 
     # Save base config for reproducibility
     import yaml
-    config_save_path = os.path.join(ckpt_folder, "config.yaml")
-    with open(config_save_path, "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False)
-    print(f"[Training] Config saved to: {config_save_path}")
-    wandb_run, wandb_run_name = init_wandb_run(args, cfg, "train_cfg")
-    if wandb_run is not None:
-        wandb_run.config.update({"checkpoint_folder": ckpt_folder}, allow_val_change=True)
-        print(f"[Training] W&B enabled: {wandb_run_name}")
+    if _is_main_process():
+        config_save_path = os.path.join(ckpt_folder, "config.yaml")
+        with open(config_save_path, "w") as f:
+            yaml.dump(cfg, f, default_flow_style=False)
+        print(f"[Training] Config saved to: {config_save_path}")
+    wandb_run, wandb_run_name = (None, None)
+    if _is_main_process():
+        wandb_run, wandb_run_name = init_wandb_run(args, cfg, "train_cfg")
+        if wandb_run is not None:
+            wandb_run.config.update({"checkpoint_folder": ckpt_folder}, allow_val_change=True)
+            print(f"[Training] W&B enabled: {wandb_run_name}")
 
     # TensorBoard writer
-    tb_writer = SummaryWriter(os.path.join(ckpt_folder, "logs"))
+    tb_writer = SummaryWriter(os.path.join(ckpt_folder, "logs")) if _is_main_process() else None
 
     # Fix random seeds
     # Avoid touching all GPUs (manual_seed_all) to prevent unintended GPU0 usage.
@@ -310,45 +385,70 @@ def main(args):
     torch.cuda.manual_seed(cfg.get("init_rand_seed", 0))
 
     # Scale LR and workers based on number of GPUs
-    num_gpus = len(args.devices)
-    cfg["opt"]["learning_rate"] *= num_gpus
+    num_gpus = world_size_env if ddp_enabled else len(args.devices)
     cfg["loader"]["num_workers"] *= num_gpus
     cfg["loader"]["num_workers"] = min(cfg["loader"]["num_workers"], args.max_workers)
-    print(
-        f"[Training] Scaled learning rate x{num_gpus}; "
-        f"num_workers capped at {cfg['loader']['num_workers']}"
-    )
+    if _is_main_process():
+        print(
+            f"[Training] DDP={ddp_enabled}, world_size={num_gpus}; "
+            f"num_workers capped at {cfg['loader']['num_workers']}"
+        )
 
     # =========================================================================
     # 2. Create dataset and dataloader
     # =========================================================================
-    print("[Training] Creating datasets...")
+    if _is_main_process():
+        print("[Training] Creating datasets...")
     train_dataset = make_dataset(
         cfg["dataset_name"], True, cfg["train_split"], **cfg["dataset"]
     )
     train_db_vars = train_dataset.get_attributes()
     cfg["model"]["train_cfg"]["head_empty_cls"] = train_db_vars.get("empty_label_ids", [])
 
-    print(f"[Training] Train samples: {len(train_dataset)}")
+    if _is_main_process():
+        print(f"[Training] Train samples: {len(train_dataset)}")
 
     # Data loaders
-    train_loader = make_data_loader(
-        train_dataset, True, rng_generator, **cfg["loader"]
+    if ddp_enabled:
+        if args.batch_size % world_size_env != 0:
+            raise ValueError(
+                f"--batch-size ({args.batch_size}) must be divisible by WORLD_SIZE ({world_size_env}) in DDP mode"
+            )
+        per_rank_batch_size = args.batch_size // world_size_env
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size_env,
+            rank=rank,
+            shuffle=True,
+            seed=cfg.get("init_rand_seed", 0),
+            drop_last=True,
+        )
+    else:
+        per_rank_batch_size = args.batch_size
+        train_sampler = None
+    train_loader = _build_data_loader(
+        train_dataset,
+        is_training=True,
+        generator=rng_generator,
+        batch_size=per_rank_batch_size,
+        num_workers=cfg["loader"]["num_workers"],
+        sampler=train_sampler,
     )
     num_iters_per_epoch = len(train_loader)
     updates_per_epoch = math.ceil(num_iters_per_epoch / args.grad_accum_steps)
     val_every_steps = _interval_to_steps(args.val_every, args.unit, updates_per_epoch, default_epochs=0.5)
     save_every_steps = _interval_to_steps(args.save_every, args.unit, updates_per_epoch, default_epochs=0.5)
-    print(
-        f"[Training] Iters per epoch: {num_iters_per_epoch}, "
-        f"updates per epoch: {updates_per_epoch} "
-        f"(grad_accum_steps={args.grad_accum_steps})"
-    )
-    print(
-        f"[Training] unit={args.unit}, "
-        f"validation every {val_every_steps} step(s), "
-        f"checkpoint save every {save_every_steps} step(s)"
-    )
+    if _is_main_process():
+        print(
+            f"[Training] Iters per epoch: {num_iters_per_epoch}, "
+            f"updates per epoch: {updates_per_epoch} "
+            f"(grad_accum_steps={args.grad_accum_steps})"
+        )
+        print(
+            f"[Training] unit={args.unit}, "
+            f"validation every {val_every_steps} step(s), "
+            f"checkpoint save every {save_every_steps} step(s)"
+        )
     if num_iters_per_epoch <= 0:
         raise RuntimeError("No training iterations available. Check dataset/split/feature files.")
 
@@ -358,17 +458,20 @@ def main(args):
     if val_every_steps > 0:
         val_cfg = deepcopy(cfg)
         val_split = [args.val_split] if args.val_split else list(val_cfg.get("val_split", ["val"]))
-        print(f"[Training] Creating validation dataset (every {val_every_steps} step[s])...")
+        if _is_main_process():
+            print(f"[Training] Creating validation dataset (every {val_every_steps} step[s])...")
         val_dataset = make_dataset(
             val_cfg["dataset_name"], False, val_split, **val_cfg["dataset"]
         )
-        print(f"[Training] Val samples: {len(val_dataset)}")
-        val_loader = make_data_loader(
+        if _is_main_process():
+            print(f"[Training] Val samples: {len(val_dataset)}")
+        val_loader = _build_data_loader(
             val_dataset,
-            False,
-            None,
+            is_training=False,
+            generator=None,
             batch_size=args.val_batch_size,
             num_workers=args.val_loader_workers,
+            sampler=None,
         )
         # Prefer true mAP evaluation when ANET evaluator can be constructed.
         try:
@@ -388,10 +491,11 @@ def main(args):
                 tiou_thresholds=tiou_thresholds,
                 num_workers=args.val_eval_workers,
             )
-            print(
-                f"[Training] Validation evaluator enabled "
-                f"(tIoU={tiou_thresholds}, gt_instances={len(val_evaluator.ground_truth)})"
-            )
+            if _is_main_process():
+                print(
+                    f"[Training] Validation evaluator enabled "
+                    f"(tIoU={tiou_thresholds}, gt_instances={len(val_evaluator.ground_truth)})"
+                )
         except Exception as e:
             val_evaluator = None
             msg = (
@@ -399,7 +503,8 @@ def main(args):
                 f"Reason: {e}"
             )
             if args.allow_val_dump_only:
-                print(msg + " -> fallback to prediction dump only.")
+                if _is_main_process():
+                    print(msg + " -> fallback to prediction dump only.")
             else:
                 raise RuntimeError(
                     msg
@@ -408,17 +513,21 @@ def main(args):
     # =========================================================================
     # 3. Create model, optimizer, scheduler
     # =========================================================================
-    print("[Training] Creating model...")
-    model = make_meta_arch(cfg["model_name"], **cfg["model"])
-    model = model.cuda(primary_device)
-    model = nn.DataParallel(model, device_ids=args.devices)
+    if _is_main_process():
+        print("[Training] Creating model...")
+    model = make_meta_arch(cfg["model_name"], **cfg["model"]).cuda(primary_device)
+    if ddp_enabled:
+        model = DDP(model, device_ids=[primary_device], output_device=primary_device)
+    elif len(args.devices) > 1:
+        model = nn.DataParallel(model, device_ids=args.devices)
 
     optimizer = make_optimizer(model, cfg["opt"])
     scheduler = make_scheduler(optimizer, cfg["opt"], updates_per_epoch)
 
     # Model EMA
-    print("[Training] Enabling Model EMA...")
-    model_ema = ModelEma(model)
+    if _is_main_process():
+        print("[Training] Enabling Model EMA...")
+    model_ema = ModelEma(_unwrap_model(model))
 
     # =========================================================================
     # 4. Resume from checkpoint (optional)
@@ -427,7 +536,8 @@ def main(args):
     global_step = 0
     if args.resume:
         if os.path.isfile(args.resume):
-            print(f"[Training] Resuming from: {args.resume}")
+            if _is_main_process():
+                print(f"[Training] Resuming from: {args.resume}")
             checkpoint = torch.load(
                 args.resume,
                 map_location=lambda storage, loc: storage.cuda(args.devices[0]),
@@ -438,7 +548,8 @@ def main(args):
             model_ema.module.load_state_dict(checkpoint["state_dict_ema"])
             optimizer.load_state_dict(checkpoint["optimizer"])
             scheduler.load_state_dict(checkpoint["scheduler"])
-            print(f"[Training] Resumed from epoch {start_epoch}, step {global_step}")
+            if _is_main_process():
+                print(f"[Training] Resumed from epoch {start_epoch}, step {global_step}")
         else:
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
 
@@ -450,13 +561,17 @@ def main(args):
         cfg["opt"]["epochs"] + cfg["opt"].get("warmup_epochs", 0),
     )
     # Save resolved runtime config after device-aware scaling.
-    runtime_config_save_path = os.path.join(ckpt_folder, "config.runtime.yaml")
-    with open(runtime_config_save_path, "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False)
-    print(f"[Training] Runtime config saved to: {runtime_config_save_path}")
+    if _is_main_process():
+        runtime_config_save_path = os.path.join(ckpt_folder, "config.runtime.yaml")
+        with open(runtime_config_save_path, "w") as f:
+            yaml.dump(cfg, f, default_flow_style=False)
+        print(f"[Training] Runtime config saved to: {runtime_config_save_path}")
 
     for epoch in range(start_epoch, max_epochs):
-        print(f"\n[Epoch {epoch+1}/{max_epochs}]")
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if _is_main_process():
+            print(f"\n[Epoch {epoch+1}/{max_epochs}]")
         model.train()
         batch_time = _AverageMeter()
         losses_tracker: dict[str, _AverageMeter] = {}
@@ -485,14 +600,14 @@ def main(args):
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 if model_ema is not None:
-                    model_ema.update(model)
+                    model_ema.update(_unwrap_model(model))
                 global_step += 1
 
-                if tb_writer is not None:
+                if tb_writer is not None and _is_main_process():
                     lr = scheduler.get_last_lr()[0]
                     tb_writer.add_scalar("train/learning_rate", lr, global_step)
                     tb_writer.add_scalar("train/final_loss", losses_tracker["final_loss"].val, global_step)
-                if wandb_run is not None:
+                if wandb_run is not None and _is_main_process():
                     lr = scheduler.get_last_lr()[0]
                     wandb.log(
                         {
@@ -504,7 +619,7 @@ def main(args):
                         step=global_step,
                     )
 
-                if (global_step != 0) and (global_step % args.print_freq == 0):
+                if _is_main_process() and (global_step != 0) and (global_step % args.print_freq == 0):
                     torch.cuda.synchronize()
                     batch_time.update((time.time() - start_time) / args.print_freq)
                     start_time = time.time()
@@ -514,51 +629,58 @@ def main(args):
                         f"Loss {losses_tracker['final_loss'].val:.4f} ({losses_tracker['final_loss'].avg:.4f})"
                     )
 
-                if global_step % save_every_steps == 0:
+                if _is_main_process() and (global_step % save_every_steps == 0):
                     _save_ckpt(
-                        ckpt_folder, cfg, model, model_ema, optimizer, scheduler,
+                        ckpt_folder, cfg, _unwrap_model(model), model_ema, optimizer, scheduler,
                         epoch, global_step, args.save_model_only
                     )
 
                 if val_loader is not None and (global_step % val_every_steps == 0):
-                    print(f"[Validation] Running at step {global_step} ...")
-                    val_output_file = os.path.join(ckpt_folder, f"val_pred_step_{global_step:08d}.pkl")
-                    val_map = _run_validation_with_nms_fallback(
-                        val_loader=val_loader,
-                        model_for_eval=model_ema.module,
-                        global_step=global_step,
-                        val_evaluator=val_evaluator,
-                        val_output_file=val_output_file,
-                        tb_writer=tb_writer,
-                        print_freq=args.print_freq,
-                    )
-                    print(
-                        f"[Validation] step={global_step} mAP={val_map:.4f} "
-                        f"(predictions saved: {val_output_file if val_evaluator is None else 'via evaluator'})"
-                    )
-                    if val_evaluator is not None and val_map <= 0.0:
+                    if ddp_enabled:
+                        dist.barrier()
+                    if _is_main_process():
+                        print(f"[Validation] Running at step {global_step} ...")
+                        val_output_file = os.path.join(ckpt_folder, f"val_pred_step_{global_step:08d}.pkl")
+                        val_map = _run_validation_with_nms_fallback(
+                            val_loader=val_loader,
+                            model_for_eval=model_ema.module,
+                            global_step=global_step,
+                            val_evaluator=val_evaluator,
+                            val_output_file=val_output_file,
+                            tb_writer=tb_writer,
+                            print_freq=args.print_freq,
+                        )
                         print(
-                            "[Validation] mAP is 0.0. This can happen early in training, "
-                            "but if it persists check class mapping / split quality."
+                            f"[Validation] step={global_step} mAP={val_map:.4f} "
+                            f"(predictions saved: {val_output_file if val_evaluator is None else 'via evaluator'})"
                         )
-                    if wandb_run is not None:
-                        wandb.log(
-                            {
-                                "validation/mAP": float(val_map),
-                                "epoch": epoch + 1,
-                                "global_step": global_step,
-                            },
-                            step=global_step,
-                        )
+                        if val_evaluator is not None and val_map <= 0.0:
+                            print(
+                                "[Validation] mAP is 0.0. This can happen early in training, "
+                                "but if it persists check class mapping / split quality."
+                            )
+                        if wandb_run is not None:
+                            wandb.log(
+                                {
+                                    "validation/mAP": float(val_map),
+                                    "epoch": epoch + 1,
+                                    "global_step": global_step,
+                                },
+                                step=global_step,
+                            )
+                    if ddp_enabled:
+                        dist.barrier()
 
         train_lr = float(scheduler.get_last_lr()[0])
-        tb_writer.add_scalar("train/lr_epoch", train_lr, epoch)
-        tb_writer.flush()
-        print(f"[Epoch {epoch+1}] lr={train_lr:.2e}, global_step={global_step}")
+        if tb_writer is not None and _is_main_process():
+            tb_writer.add_scalar("train/lr_epoch", train_lr, epoch)
+            tb_writer.flush()
+        if _is_main_process():
+            print(f"[Epoch {epoch+1}] lr={train_lr:.2e}, global_step={global_step}")
 
-        if (global_step % save_every_steps) != 0:
+        if _is_main_process() and ((global_step % save_every_steps) != 0):
             _save_ckpt(
-                ckpt_folder, cfg, model, model_ema, optimizer, scheduler,
+                ckpt_folder, cfg, _unwrap_model(model), model_ema, optimizer, scheduler,
                 epoch, global_step, args.save_model_only
             )
 
@@ -573,12 +695,16 @@ def main(args):
                 artifact.add_file(ckpt_path)
                 wandb_run.log_artifact(artifact)
 
-    print(f"\n[Training] Finished training. Results in: {ckpt_folder}")
-    tb_writer.close()
-    if wandb_run is not None:
+    if _is_main_process():
+        print(f"\n[Training] Finished training. Results in: {ckpt_folder}")
+    if tb_writer is not None:
+        tb_writer.close()
+    if wandb_run is not None and _is_main_process():
         wandb_run.summary["final_global_step"] = global_step
         wandb_run.summary["final_epoch"] = max_epochs
         wandb_run.finish()
+    if ddp_enabled and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -718,6 +844,15 @@ if __name__ == "__main__":
         "--wandb-log-ckpt",
         action="store_true",
         help="Upload saved checkpoints as W&B artifacts",
+    )
+    parser.add_argument(
+        "--ddp-timeout-hours",
+        type=int,
+        default=6,
+        help=(
+            "Process group timeout in hours for DDP collectives. "
+            "Set 0 to effectively disable timeout."
+        ),
     )
 
     args = parser.parse_args()

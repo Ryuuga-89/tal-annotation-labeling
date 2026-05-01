@@ -39,4 +39,12 @@ ARGS+=(--devices "${DEVICE_ARR[@]}")
 
 echo "[train] config=$CONFIG"
 echo "[train] output=$OUTPUT_FOLDER tag=$TAG devices=$DEVICES epochs=$MAX_EPOCHS"
-uv run python scripts/train_tal.py "${ARGS[@]}"
+NUM_DEVICES="${#DEVICE_ARR[@]}"
+if (( NUM_DEVICES > 1 )); then
+  CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${DEVICE_ARR[*]}")"
+  export CUDA_VISIBLE_DEVICES
+  echo "[train] launching DDP with nproc_per_node=$NUM_DEVICES, CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+  uv run python -m torch.distributed.run --standalone --nproc_per_node "$NUM_DEVICES" scripts/train_tal.py "${ARGS[@]}"
+else
+  uv run python scripts/train_tal.py "${ARGS[@]}"
+fi

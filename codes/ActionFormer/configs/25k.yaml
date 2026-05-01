@@ -28,10 +28,10 @@ dataset: {
   force_upsampling: False,
   # ---- tal_motion-specific ----
   annot_dir: /raid/containers/enroot/data/b100/ft_fact_videos/annot/30s_chunks_action_31detail_2,
-  split_list_dir: data/splits/v1,
-  aux_vocab_file: data/aux_stats/v1/aux_vocab.json,
+  split_list_dir: data/splits/25k,
+  aux_vocab_file: data/aux_stats/25k/aux_vocab.json,
   label_mode: combined,              # binary | combined
-  combined_vocab_file: data/aux_stats/v1/combined_vocab_merged.json,
+  combined_vocab_file: data/aux_stats/25k/combined_vocab_merged.json,
   merge_combined_labels: True,
   aux_fields: ['body_part', 'action_type', 'grip_or_contact', 'speed_or_force', 'posture_change'],
   skip_no_actions: True,
