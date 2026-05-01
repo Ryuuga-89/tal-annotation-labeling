@@ -6,9 +6,3 @@ export ANNOT_ROOT_DIR=/raid/containers/enroot/data/b100/ft_fact_videos/annot/30s
 export VIDEO_DATA_DIR=/raid/containers/enroot/data/b100/ft_fact_videos/30s_chunks
 cd /lustre/work/mt/okamura/tal-annotation-labeling
 ```
-
-# ログイン
-
-```bash
-srun --overlap --jobid=1262596 --pty bash
-```
