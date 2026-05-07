@@ -36,7 +36,7 @@ if "actionformer_libs" not in sys.modules:
             sys.modules["h5py"] = types.ModuleType("h5py")
     # Upstream `libs/utils/nms.py` imports the C++ extension `nms_1d_cpu` at
     # module load time. The extension has to be built (`cd repos/ActionFormer/
-    # libs/utils && python setup.py build_ext --inplace`) before training /
+    # libs/utils && uv run python setup.py build_ext --inplace`) before training /
     # NMS-using inference. We stub it so that *importing* the package (e.g.
     # for dataset registration) does not require the build.
     _UTILS_DIR = _REPO_ROOT / "libs" / "utils"
@@ -72,9 +72,9 @@ if "actionformer_libs" not in sys.modules:
 
             def _missing(*_a, **_kw):
                 raise RuntimeError(
-                    "nms_1d_cpu extension not built. Run: "
+                    "nms_1d_cpu extension not built. Run from repo root: "
                     "cd repos/ActionFormer/libs/utils && "
-                    "python setup.py build_ext --inplace"
+                    "uv run python setup.py build_ext --inplace"
                 )
 
             stub.nms = _missing  # type: ignore[attr-defined]

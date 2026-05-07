@@ -124,16 +124,33 @@ def load_model(cfg: dict, ckpt_path: str, device_index: int, use_cuda: bool) -> 
         checkpoint = torch.load(
             ckpt_path,
             map_location=lambda storage, loc: storage.cuda(device_index),
+            weights_only=False,
         )
     else:
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     # Try loading EMA model first, fall back to regular state_dict
     if "state_dict_ema" in checkpoint:
         print("  -> Loading EMA model state")
-        model.load_state_dict(checkpoint["state_dict_ema"])
+        state_dict = checkpoint["state_dict_ema"]
     else:
         print("  -> Loading regular model state")
-        model.load_state_dict(checkpoint["state_dict"])
+        state_dict = checkpoint["state_dict"]
+
+    # Accept both key formats:
+    # - DataParallel: module.xxx
+    # - non-DataParallel: xxx
+    model_keys = model.state_dict().keys()
+    model_uses_module_prefix = any(k.startswith("module.") for k in model_keys)
+    ckpt_uses_module_prefix = any(k.startswith("module.") for k in state_dict.keys())
+    if model_uses_module_prefix and not ckpt_uses_module_prefix:
+        state_dict = {f"module.{k}": v for k, v in state_dict.items()}
+    elif (not model_uses_module_prefix) and ckpt_uses_module_prefix:
+        state_dict = {
+            (k[len("module."):] if k.startswith("module.") else k): v
+            for k, v in state_dict.items()
+        }
+
+    model.load_state_dict(state_dict)
 
     model.eval()
     return model

@@ -206,3 +206,61 @@ srun --jobid ジョブID --overlap --partition 104-partition nvidia-smi
 ```bash
 srun --jobid ジョブID --overlap --partition 104-partition watch -n 1 nvidia-smi
 ```
+
+## チェックポイント推論テスト
+
+スクリプトは `scripts/run_checkpoint_infer_test.py`。指定した ActionFormer チェックポイントで推論し、結果・コピーした元動画・可視化動画を1つの出力ディレクトリにまとめる。
+
+### 前提
+
+- 環境変数 `ANNOT_ROOT_DIR` / `VIDEO_DATA_DIR` が参照可能であること（学習・評価と同様）。
+- 候補1件あたり、`ANNOT_ROOT_DIR/<stem>.json`・`VIDEO_DATA_DIR/<stem>.mp4`・`--feat-dir`（または config の `dataset.feat_folder`）配下の `<stem>.npy` が揃っている必要がある。
+
+### 母集団（ランダム抽出の対象）
+
+- `--population-list-txt` で、1行1エントリのテキストを指定する。各行は `.json` や特徴量パスなど任意のパス文字列でよく、**ファイル名の stem** が母集団に登録される（`data/splits/ALL/test.txt` のように `data/features/ALL/....json` が並ぶ形式に対応）。
+- **省略時のデフォルトは `data/splits/ALL/test.txt`**。
+- 登録された stem のうち、上記3点（annotation / mp4 / npy）が揃ったものだけが実際の抽選候補になる。
+
+### 手動実行例
+
+```bash
+uv run python scripts/run_checkpoint_infer_test.py \
+  --config codes/ActionFormer/configs/tal_motion_vit_b.yaml \
+  --checkpoint outputs/.../step_XXXXXXXX.pth.tar \
+  --num-videos 10 \
+  --seed 42 \
+  --feat-dir data/features/ALL \
+  --population-list-txt data/splits/ALL/test.txt \
+  --output-dir outputs/infer_test/example_seed42
+```
+
+- `--feat-dir` を省略すると config の `dataset.feat_folder` が使われる。クラスタでは実データが `data/features/ALL` にあることが多いため、**明示指定を推奨**する。
+- `--population-list-txt` を省略すると **`data/splits/ALL/test.txt`** が使われる。
+
+### Slurm からの実行
+
+- 例: `scripts/sbatch/sbatch_infer_test_all_binary_1gpu.sh`
+- ジョブ内で `uv sync` の後に上記スクリプトを呼ぶ。チェックポイントパス・出力ディレクトリ・`FEAT_DIR` 等はスクリプト内で必要に応じて編集する。
+
+### 出力ディレクトリ構成
+
+| パス | 内容 |
+|------|------|
+| `manifest.json` | config / checkpoint / seed / `num_videos` / `population_list_txt` / 各サンプルの annotation・元動画・コピー先・可視化動画・特徴量パス |
+| `predictions.json` | 動画 stem ごとの推論結果（`start_time` / `end_time` / `score`、マルチクラス時は `class_id` 等） |
+| `predictions_readable.txt` | 人間向け要約。`start_time` 昇順、`start-end` 形式の行 |
+| `videos/<stem>.mp4` | 元動画の**実ファイルコピー**（シンボリックリンクではない） |
+| `visualizations/<stem>.mp4` | 区間表示を重ねた動画（後述） |
+
+### 可視化（`visualizations/`）
+
+- 映像の左上付近にインジケータを表示する。
+  - **GT（アノテーション区間）**: 赤。区間内は点灯。
+  - **推論区間**: 緑。区間内は点灯。
+- GT が **終了時刻と次区間の開始時刻が一致する連続区間**（例: 1.4–1.6 の次に 1.6–2.0）のとき、**接点付近で約1フレーム分だけ GT を消灯**し、区切りが分かるようにしている。
+- 可視化 MP4 は **`imageio-ffmpeg` 経由で H.264（yuv420p）** を優先して書き出し、多くのプレーヤで再生できるようにしている（依存は `pyproject.toml` の `imageio-ffmpeg`）。失敗時は OpenCV の `VideoWriter` にフォールバックする。
+
+### 関連実装メモ
+
+- `scripts/infer_tal.py` のチェックポイント読み込みでは、`state_dict` のキーに `module.` プレフィックスがある／ない場合を自動で合わせる（単GPU学習の重みと `DataParallel` 推論の両方に対応）。

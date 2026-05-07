@@ -1,5 +1,5 @@
-# Class-agnostic TAL on the 30s/10s chunk dataset, using VideoMAE V2 ViT-B
-# features (embed_dim=768, target_fps=10, window=16, stride=2).
+# Binary (class-agnostic) TAL: event vs background, num_classes=1.
+# VideoMAE V2 ViT-B features (embed_dim=768, target_fps=10, window=16, stride=2).
 #
 # Sequence length budget:
 #   30s @ 10fps, window=16, stride=2 -> num_steps = 143
@@ -16,7 +16,7 @@ dataset: {
   feat_folder: data/features/30s_mae_b_16_2,
   file_prefix: ~,
   file_ext: .npy,
-  num_classes: 164,                  # combined_label classes from vocab (incl. OTHER)
+  num_classes: 1,                    # binary / class-agnostic (foreground vs background)
   input_dim: 768,
   feat_stride: 2,                    # frames per feat step (= extractor stride)
   num_frames: 16,                    # frames per feat clip (= window)
@@ -30,9 +30,7 @@ dataset: {
   annot_dir: /raid/containers/enroot/data/b100/ft_fact_videos/annot/30s_chunks_action_31detail_2,
   split_list_dir: data/splits/v1,
   aux_vocab_file: data/aux_stats/v1/aux_vocab.json,
-  label_mode: combined,              # binary | combined
-  combined_vocab_file: data/aux_stats/v1/combined_vocab_merged.json,
-  merge_combined_labels: True,
+  label_mode: binary,                # binary | combined
   aux_fields: ['body_part', 'action_type', 'grip_or_contact', 'speed_or_force', 'posture_change'],
   skip_no_actions: True,
   tiou_thresholds: [0.3, 0.4, 0.5, 0.6, 0.7],
@@ -100,8 +98,8 @@ test_cfg: {
   nms_method: soft,
   nms_sigma: 0.5,
   duration_thresh: 0.05,
-  multiclass_nms: True,
+  multiclass_nms: False,
   voting_thresh: 0.7,
 }
 
-output_folder: ./ckpt/tal_motion_vit_b/
+output_folder: ./ckpt/tal_motion_vit_b_binary/

@@ -3,6 +3,7 @@ from .annotation import (
     AnnotationRecord,
     StepGTSegment,
     actions_to_step_segments,
+    annotation_record_for_video_only,
     load_annotation,
     time_to_step,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "VideoSpec",
     "ClipBatch",
     "VideoChunkDataset",
+    "annotation_record_for_video_only",
     "load_annotation",
     "actions_to_step_segments",
     "time_to_step",

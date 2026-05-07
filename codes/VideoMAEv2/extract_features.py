@@ -56,6 +56,7 @@ if str(_PKG_PARENT) not in sys.path:
 from VideoMAEv2.dataset import (  # noqa: E402
     AnnotationRecord,
     VideoChunkDataset,
+    annotation_record_for_video_only,
 )
 from VideoMAEv2.dataset.chunk_dataset import collate_clips, pair_video_with_annotation  # noqa: E402
 from VideoMAEv2.models import build_backbone  # noqa: E402
@@ -284,6 +285,243 @@ def _auto_batch_size_for_device(device: torch.device, fallback: int) -> int:
     return fallback
 
 
+def _sliding_window_feature_array(
+    ds: VideoChunkDataset,
+    backbone,
+    cfg: ExtractConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+    save_dtype: np.dtype,
+) -> np.ndarray:
+    """Run VideoMAE forward on all sliding-window clips; return [num_steps, C]."""
+    num_steps = len(ds)
+    feats = np.empty((num_steps, backbone.embed_dim), dtype=save_dtype)
+
+    autocast_enabled = device.type == "cuda" and dtype != torch.float32
+    pin_memory = device.type == "cuda"
+
+    use_direct_batching = int(cfg.num_workers or 0) == 0
+    loader = None
+    if not use_direct_batching:
+        loader = DataLoader(
+            ds,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=int(cfg.num_workers or 0),
+            pin_memory=pin_memory,
+            collate_fn=collate_clips,
+            persistent_workers=bool(cfg.num_workers and cfg.num_workers > 0),
+        )
+
+    t_preproc = 0.0
+    t_infer = 0.0
+    t_postproc = 0.0
+    batch_i = 0
+
+    if use_direct_batching:
+        if cfg.decode_mode == "auto":
+            if cfg.resize_mode == "squash" and not cfg.decode_resize_on_read:
+                effective_decode_mode = "batch"
+            else:
+                effective_decode_mode = (
+                    "full" if ds.spec.num_target_frames <= cfg.auto_batch_threshold_frames else "batch"
+                )
+        else:
+            effective_decode_mode = cfg.decode_mode
+
+        effective_batch_size = cfg.batch_size
+        if effective_decode_mode == "batch":
+            effective_batch_size = min(cfg.batch_size, cfg.max_batch_size_batch_decode)
+
+        if effective_decode_mode == "full":
+            t_prep_start = time.perf_counter()
+            all_clips = ds.windowed_clips()
+            t_prep_end = time.perf_counter()
+            t_preproc += t_prep_end - t_prep_start
+            batch_iter = (
+                (s, min(s + effective_batch_size, num_steps))
+                for s in range(0, num_steps, effective_batch_size)
+            )
+        else:
+            all_clips = None
+            batch_iter = (
+                (s, min(s + effective_batch_size, num_steps))
+                for s in range(0, num_steps, effective_batch_size)
+            )
+
+        for start, end in batch_iter:
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+            t_prep_start = time.perf_counter()
+            if effective_decode_mode == "full":
+                clips_cpu = all_clips[start:end]
+            else:
+                clips_cpu = ds.batch_clips(start, end)
+            clips = clips_cpu.to(device, non_blocking=True)
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+            t_prep_end = time.perf_counter()
+            t_preproc += t_prep_end - t_prep_start
+
+            with torch.inference_mode():
+                if autocast_enabled:
+                    with torch.autocast(device_type="cuda", dtype=dtype):
+                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+                        t_inf_start = time.perf_counter()
+                        out = backbone(clips)
+                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+                        t_inf_end = time.perf_counter()
+                else:
+                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+                    t_inf_start = time.perf_counter()
+                    out = backbone(clips)
+                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+                    t_inf_end = time.perf_counter()
+            t_infer += t_inf_end - t_inf_start
+
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+            t_post_start = time.perf_counter()
+            out_cpu = out.detach()
+            if save_dtype == np.float16:
+                feats[start:end] = out_cpu.to(torch.float16).cpu().numpy()
+            else:
+                feats[start:end] = out_cpu.to(torch.float32).cpu().numpy()
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+            t_post_end = time.perf_counter()
+            t_postproc += t_post_end - t_post_start
+
+            del clips_cpu, clips, out, out_cpu
+            batch_i += 1
+            if cfg.cleanup_interval_batches and (batch_i % cfg.cleanup_interval_batches == 0):
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+        if all_clips is not None:
+            del all_clips
+    else:
+        batch_fetch_start = time.perf_counter()
+        for batch in loader:
+            batch_fetched = time.perf_counter()
+            t_preproc += batch_fetched - batch_fetch_start
+
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+            t_move_start = time.perf_counter()
+            clips = batch.clips.to(device, non_blocking=True)
+            idx = batch.step_idx.numpy()
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+            t_move_end = time.perf_counter()
+            t_preproc += t_move_end - t_move_start
+
+            with torch.inference_mode():
+                if autocast_enabled:
+                    with torch.autocast(device_type="cuda", dtype=dtype):
+                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+                        t_inf_start = time.perf_counter()
+                        out = backbone(clips)
+                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+                        t_inf_end = time.perf_counter()
+                else:
+                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+                    t_inf_start = time.perf_counter()
+                    out = backbone(clips)
+                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+                    t_inf_end = time.perf_counter()
+            t_infer += t_inf_end - t_inf_start
+
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+            t_post_start = time.perf_counter()
+            out_cpu = out.detach().to("cpu")
+            if save_dtype == np.float16:
+                feats[idx] = out_cpu.to(torch.float16).numpy()
+            else:
+                feats[idx] = out_cpu.to(torch.float32).numpy()
+            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
+            t_post_end = time.perf_counter()
+            t_postproc += t_post_end - t_post_start
+
+            del clips, out, out_cpu, idx, batch
+            batch_i += 1
+
+            if cfg.cleanup_interval_batches and (batch_i % cfg.cleanup_interval_batches == 0):
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            batch_fetch_start = time.perf_counter()
+
+    del loader
+    return feats
+
+
+def extract_features_array(
+    video_path: str | Path,
+    *,
+    backbone,
+    cfg: ExtractConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+    save_dtype: np.dtype,
+) -> tuple[np.ndarray | None, dict]:
+    """Extract VideoMAE features into memory as float32 [T, embed_dim].
+
+    Does not write npy/json. Uses the same sliding-window logic as ``extract_one``.
+    """
+    video_path = Path(video_path)
+    rec = annotation_record_for_video_only(video_path)
+    if not video_path.exists():
+        return None, {"status": "missing_video", "stem": rec.video_stem, "msg": str(video_path)}
+
+    t_ds_start = time.perf_counter()
+    ds = VideoChunkDataset(
+        video_path,
+        target_fps=cfg.target_fps,
+        window_size=cfg.window_size,
+        stride=cfg.stride,
+        input_size=cfg.input_size,
+        resize_mode=cfg.resize_mode,
+        decode_threads=cfg.decode_threads,
+        decode_resize_on_read=cfg.decode_resize_on_read,
+    )
+    t_load = time.perf_counter() - t_ds_start
+
+    if len(ds) == 0:
+        return None, {
+            "status": "too_short",
+            "stem": rec.video_stem,
+            "duration": ds.spec.duration_sec,
+            "num_target_frames": ds.spec.num_target_frames,
+            "t_load": t_load,
+        }
+
+    num_steps = len(ds)
+    feats = _sliding_window_feature_array(ds, backbone, cfg, device, dtype, save_dtype)
+    feats_f32 = feats.astype(np.float32, copy=False)
+
+    meta = {
+        "stem": rec.video_stem,
+        "status": "ok",
+        "video_path": str(video_path),
+        "duration_sec": ds.spec.duration_sec,
+        "src_fps": ds.spec.src_fps,
+        "src_num_frames": ds.spec.src_num_frames,
+        "target_fps": cfg.target_fps,
+        "num_target_frames": ds.spec.num_target_frames,
+        "window_size": cfg.window_size,
+        "stride": cfg.stride,
+        "input_size": cfg.input_size,
+        "resize_mode": cfg.resize_mode,
+        "num_steps": num_steps,
+        "embed_dim": backbone.embed_dim,
+        "model_name": cfg.model_name,
+        "ckpt_path": cfg.ckpt_path,
+        "save_dtype": cfg.save_dtype,
+        "compute_dtype": cfg.dtype,
+        "t_load": t_load,
+        "step_time": _make_step_time_index(num_steps, cfg.target_fps, cfg.stride, cfg.window_size),
+    }
+    ds.release_cache()
+    del ds
+    return feats_f32, meta
+
+
 def extract_one(
     backbone,
     video_path: Path,
@@ -335,165 +573,11 @@ def extract_one(
         }
 
     num_steps = len(ds)
-    feats = np.empty((num_steps, backbone.embed_dim), dtype=save_dtype)
-
-    autocast_enabled = device.type == "cuda" and dtype != torch.float32
-    pin_memory = device.type == "cuda"
-
-    use_direct_batching = int(cfg.num_workers or 0) == 0
-    loader = None
-    if not use_direct_batching:
-        loader = DataLoader(
-            ds,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=int(cfg.num_workers or 0),
-            pin_memory=pin_memory,
-            collate_fn=collate_clips,
-            persistent_workers=bool(cfg.num_workers and cfg.num_workers > 0),
-        )
-
-    # Per-stage accumulators
     t_preproc = 0.0
-    t_infer = 0.0
     t_postproc = 0.0
-
-    batch_i = 0
-    if use_direct_batching:
-        if cfg.decode_mode == "auto":
-            # Keep "full" only for short clips when decode-time resize is enabled.
-            # If decode_resize_on_read is off, full mode has to CPU-resize the
-            # entire target-fps sequence at once and becomes preproc-bound.
-            if cfg.resize_mode == "squash" and not cfg.decode_resize_on_read:
-                effective_decode_mode = "batch"
-            else:
-                effective_decode_mode = (
-                    "full" if ds.spec.num_target_frames <= cfg.auto_batch_threshold_frames else "batch"
-                )
-        else:
-            effective_decode_mode = cfg.decode_mode
-
-        effective_batch_size = cfg.batch_size
-        if effective_decode_mode == "batch":
-            effective_batch_size = min(cfg.batch_size, cfg.max_batch_size_batch_decode)
-
-        if effective_decode_mode == "full":
-            # Stable path for short clips (our 30s chunks): decode once and unfold.
-            t_prep_start = time.perf_counter()
-            all_clips = ds.windowed_clips()  # [N, 3, T, H, W]
-            t_prep_end = time.perf_counter()
-            t_preproc += (t_prep_end - t_prep_start)
-            batch_iter = (
-                (s, min(s + effective_batch_size, num_steps))
-                for s in range(0, num_steps, effective_batch_size)
-            )
-        else:
-            # Lower memory path: decode only frames needed per batch.
-            all_clips = None
-            batch_iter = (
-                (s, min(s + effective_batch_size, num_steps))
-                for s in range(0, num_steps, effective_batch_size)
-            )
-
-        for start, end in batch_iter:
-            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-            t_prep_start = time.perf_counter()
-            if effective_decode_mode == "full":
-                clips_cpu = all_clips[start:end]
-            else:
-                clips_cpu = ds.batch_clips(start, end)  # [B, 3, T, H, W]
-            clips = clips_cpu.to(device, non_blocking=True)
-            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-            t_prep_end = time.perf_counter()
-            t_preproc += (t_prep_end - t_prep_start)
-
-            with torch.inference_mode():
-                if autocast_enabled:
-                    with torch.autocast(device_type="cuda", dtype=dtype):
-                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-                        t_inf_start = time.perf_counter()
-                        out = backbone(clips)
-                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-                        t_inf_end = time.perf_counter()
-                else:
-                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-                    t_inf_start = time.perf_counter()
-                    out = backbone(clips)
-                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-                    t_inf_end = time.perf_counter()
-            t_infer += (t_inf_end - t_inf_start)
-
-            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-            t_post_start = time.perf_counter()
-            out_cpu = out.detach()
-            if save_dtype == np.float16:
-                feats[start:end] = out_cpu.to(torch.float16).cpu().numpy()
-            else:
-                feats[start:end] = out_cpu.to(torch.float32).cpu().numpy()
-            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-            t_post_end = time.perf_counter()
-            t_postproc += (t_post_end - t_post_start)
-
-            del clips_cpu, clips, out, out_cpu
-            batch_i += 1
-            if cfg.cleanup_interval_batches and (batch_i % cfg.cleanup_interval_batches == 0):
-                gc.collect()
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-        if all_clips is not None:
-            del all_clips
-    else:
-        # We'll measure time spent waiting for the batch (this includes collate/preprocess)
-        batch_fetch_start = time.perf_counter()
-        for batch in loader:
-            batch_fetched = time.perf_counter()
-            t_preproc += (batch_fetched - batch_fetch_start)
-
-            # move clips to device (non-blocking attempt)
-            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-            t_move_start = time.perf_counter()
-            clips = batch.clips.to(device, non_blocking=True)
-            idx = batch.step_idx.numpy()
-            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-            t_move_end = time.perf_counter()
-            t_preproc += (t_move_end - t_move_start)
-
-            with torch.inference_mode():
-                if autocast_enabled:
-                    with torch.autocast(device_type="cuda", dtype=dtype):
-                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-                        t_inf_start = time.perf_counter()
-                        out = backbone(clips)
-                        _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-                        t_inf_end = time.perf_counter()
-                else:
-                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-                    t_inf_start = time.perf_counter()
-                    out = backbone(clips)
-                    _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-                    t_inf_end = time.perf_counter()
-            t_infer += (t_inf_end - t_inf_start)
-
-            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-            t_post_start = time.perf_counter()
-            out_cpu = out.detach().to("cpu")
-            if save_dtype == np.float16:
-                feats[idx] = out_cpu.to(torch.float16).numpy()
-            else:
-                feats[idx] = out_cpu.to(torch.float32).numpy()
-            _maybe_cuda_sync(device, cfg.sync_cuda_timing)
-            t_post_end = time.perf_counter()
-            t_postproc += (t_post_end - t_post_start)
-
-            del clips, out, out_cpu, idx, batch
-            batch_i += 1
-
-            if cfg.cleanup_interval_batches and (batch_i % cfg.cleanup_interval_batches == 0):
-                gc.collect()
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-            batch_fetch_start = time.perf_counter()
+    t_run_start = time.perf_counter()
+    feats = _sliding_window_feature_array(ds, backbone, cfg, device, dtype, save_dtype)
+    t_infer = time.perf_counter() - t_run_start
 
     # --- stage: save to disk ---
     t_save_start = time.perf_counter()
@@ -527,7 +611,7 @@ def extract_one(
 
     # end-of-video cleanup (avoid forced per-video GC/empty_cache: expensive)
     ds.release_cache()
-    del ds, feats, loader
+    del ds, feats
 
     elapsed = time.perf_counter() - t_start
     # Return detailed stage timings for profiling
@@ -637,7 +721,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         json_paths = pending
     if not json_paths:
-        raise SystemExit(f"no annotation json files under {annot_dir}")
+        # Empty after glob/list: real configuration error. Empty after shard / prefilter:
+        # nothing left for this shard (all outputs exist, or empty shard slice) — OK.
+        if total_in_split == 0:
+            raise SystemExit(f"no annotation json files under {annot_dir}")
+        print(
+            f"[prefilter] nothing to extract for shard {cfg.shard_id}/{cfg.num_shards}: "
+            "no pending items (empty shard slice or all outputs already exist). Exiting 0.",
+            flush=True,
+        )
+        return 0
 
     # Determine device: if gpu_id is specified and cuda is available, use cuda:gpu_id
     if cfg.device == "cuda" and cfg.gpu_id is not None:

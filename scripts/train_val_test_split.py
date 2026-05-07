@@ -127,8 +127,14 @@ def main():
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # ディレクトリ内のファイルを取得
+    # ディレクトリ内のファイルを取得（VideoMAE 抽出の index*.json は分割対象外）
     json_files_all = sorted(glob.glob(os.path.join(feature_dir, "*.json")))
+    json_files_all = [
+        p
+        for p in json_files_all
+        if os.path.basename(p) != "index.json"
+        and not os.path.basename(p).startswith("index.shard")
+    ]
 
     # Always filter out invalid JSON files from split candidates.
     json_files = []

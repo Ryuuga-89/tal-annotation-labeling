@@ -84,6 +84,19 @@ class AnnotationRecord:
         return len(self.actions)
 
 
+def annotation_record_for_video_only(video_path: str | Path) -> AnnotationRecord:
+    """Minimal record for feature extraction without an annotation JSON file."""
+    video_path = Path(video_path)
+    return AnnotationRecord(
+        json_path=Path("-"),
+        video_stem=video_path.stem,
+        video_path_in_json=str(video_path),
+        video_duration=0.0,
+        video_fps=0.0,
+        actions=[],
+    )
+
+
 def load_annotation(json_path: str | Path) -> AnnotationRecord:
     json_path = Path(json_path)
     with json_path.open("r", encoding="utf-8") as f:

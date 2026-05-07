@@ -25,3 +25,6 @@
 [submodule "repos/AVION"]
 	path = repos/AVION
 	url = https://github.com/zhaoyue-zephyrus/AVION.git
+[submodule "repos/TriDet"]
+	path = repos/TriDet
+	url = https://github.com/dingfengshi/TriDet.git
